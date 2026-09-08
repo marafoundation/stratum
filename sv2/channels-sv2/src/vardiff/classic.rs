@@ -184,7 +184,7 @@ const MAX_STEP_RATIO: f32 = 2.0;
 ///
 /// Old evidence decays on the clock at `e^(−Δt/tau)`, which is what makes the window unable to
 /// entrench: it forgets whether or not the controller ever decides to act.
-const EWMA_TAU_SECS: u64 = 360;
+pub(crate) const EWMA_TAU_SECS: u64 = 360;
 
 use super::{
     clock::{Clock, SystemClock},

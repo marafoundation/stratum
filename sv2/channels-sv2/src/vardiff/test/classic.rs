@@ -13,7 +13,7 @@ use super::{
     test_try_vardiff_with_shares_less_than_30, test_try_vardiff_with_shares_more_than_60s, Vardiff,
 };
 use crate::vardiff::classic::{
-    DIRECTION_DISCOUNT_PER_OBSERVATION, MAX_DIRECTION_DISCOUNT, STEP_FRACTION_BASE,
+    DIRECTION_DISCOUNT_PER_OBSERVATION, EWMA_TAU_SECS, MAX_DIRECTION_DISCOUNT, STEP_FRACTION_BASE,
     STEP_FRACTION_GROWTH, STEP_FRACTION_MAX,
 };
 
@@ -311,34 +311,46 @@ fn test_estimator_forgets_on_the_clock() {
         "seeding should take the first observation whole, got {seeded}"
     );
 
-    // A quarter of a time constant of silence discards `1 − e^(−1/4)` of the stored rate.
-    simulate_shares_and_wait(&mut single, 0, 90);
+    // An eighth of a time constant of silence discards `1 − e^(−1/8)` of the stored rate. Derived
+    // from EWMA_TAU_SECS rather than written as a literal: the previous form hardcoded 90 s and
+    // `e^(−0.25)`, which only agree while tau is 360, so it asserted a tau-specific number while
+    // claiming a general property. An eighth rather than a quarter because the resulting deviation
+    // must stay under the retarget boundary at the same window for the decay to be observable, and
+    // a quarter-tau gap clears it once the direction discount applies.
+    // Defined as two halves so the split-gap comparison below is exact by construction rather
+    // than by integer-division rounding: `2 * half` is what this single gap advances.
+    let half = EWMA_TAU_SECS / 16;
+    let gap = half * 2;
+    simulate_shares_and_wait(&mut single, 0, gap);
     let fired = single
         .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
         .expect("try_vardiff failed");
-    assert!(fired.is_none(), "a 90s gap should stay under the boundary");
-    let expected = seeded * (-0.25f64).exp();
+    assert!(
+        fired.is_none(),
+        "an eighth-tau gap should stay under the boundary"
+    );
+    let expected = seeded * (-(gap as f64) / EWMA_TAU_SECS as f64).exp();
     let decayed = single.ewma_rate();
     assert!(
         (decayed / expected - 1.0).abs() < 1e-3,
-        "after a quarter of a tau the rate should be {expected}, got {decayed}"
+        "after an eighth of a tau the rate should be {expected}, got {decayed}"
     );
 
-    // Decay tracks elapsed time, not the number of evaluations: two eighth-tau gaps must land
-    // where one quarter-tau gap did. A per-evaluation constant would forget twice as much here, which
-    // is how an irregular cadence silently changes a filter's memory.
+    // Decay tracks elapsed time, not the number of evaluations: two half-gaps must land where one
+    // whole gap did. A per-evaluation constant would forget twice as much here, which is how an
+    // irregular cadence silently changes a filter's memory.
     let mut split = new_test_vardiff_state().expect("Failed to create VardiffState");
     seed(&mut split);
     for _ in 0..2 {
-        simulate_shares_and_wait(&mut split, 0, 45);
+        simulate_shares_and_wait(&mut split, 0, half);
         let fired = split
             .try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
             .expect("try_vardiff failed");
-        assert!(fired.is_none(), "a 45s gap should stay under the boundary");
+        assert!(fired.is_none(), "a half-gap should stay under the boundary");
     }
     assert!(
         (split.ewma_rate() / decayed - 1.0).abs() < 1e-3,
-        "two eighth-tau gaps ({}) should decay the same as one quarter-tau ({decayed})",
+        "two half-gaps ({}) should decay the same as one whole gap ({decayed})",
         split.ewma_rate()
     );
 }
@@ -558,7 +570,13 @@ fn test_same_direction_run_accumulates_resets_and_clears() {
     }
 
     // One evaluation delivering well over target reverses the direction and restarts the count.
-    for _ in 0..60 {
+    //
+    // The multiple has to be large enough to flip the filter's stored rate in a single observation
+    // at any `EWMA_TAU_SECS`, because the point under test is the run bookkeeping, not the
+    // estimator's speed. A longer tau weights one observation less — at 1200 s a single evaluation
+    // blends in only `1 − e^(−60/1200)` ≈ 4.9% of the new rate — so a stimulus sized for tau = 360
+    // silently stops producing a reversal and the test then measures tau rather than the reversal.
+    for _ in 0..(TEST_SHARES_PER_MINUTE as u32 * 30) {
         vardiff.increment_shares_since_last_update();
     }
     clock.advance(60);
