@@ -53,7 +53,48 @@ const POISSON_Z: f64 = 2.576;
 /// hardware, comfortably inside the band, and it is load-bearing rather than an error — it parks
 /// the excursion band below the level at which a switch-miner leaves. Widening this constant or
 /// narrowing the multiplier moves the dead zone and therefore moves the offset.
-const MIN_THRESHOLD_FRACTION: f64 = 0.05;
+pub(crate) const MIN_THRESHOLD_FRACTION: f64 = 0.05;
+
+/// Weight on the estimator's own reported spread when sizing the dense floor: the floor becomes
+/// `MIN_THRESHOLD_FRACTION + UNCERTAINTY_FLOOR_WEIGHT × ratio_std`. **This is the C6b fix.**
+///
+/// The defect it answers: at the shipping rate the static floor sits at roughly *half* the
+/// estimator's noise, so a converged, on-target channel clears its own threshold on sampling
+/// noise alone and retargets for no reason. Feeding the spread in lifts the margin `floor/σ` from
+/// 0.50 to 1.00 at τ=360, and to 1.41 at τ=1200 — at or above `floor ≥ σ`, where noise-driven
+/// firing stops being rare and becomes algebraically impossible.
+///
+/// Why a σ-proportional term rather than a bigger constant: the added amount scales with the
+/// noise, so it vanishes where the noise does. A larger `MIN_THRESHOLD_FRACTION` would buy the
+/// same margin at low rate and then keep charging for it at high rate, where the estimator is
+/// already precise. This costs nothing at 30–60 spm.
+///
+/// **What it does cost, stated because the constant above already predicts it.**
+/// `MIN_THRESHOLD_FRACTION`'s own doc says widening it moves the dead zone and therefore moves
+/// the settled offset. This widens it, conditionally, and simulation measures exactly that: the
+/// settled belief goes from ≈ −8% to ≈ −11% at the shipping rate (−2.67 pp at 6 spm, −2.46 at 8,
+/// −2.12 at 12, −0.61 at 20, and +0.88 at 30 where reduced hunting takes over). The offset is
+/// load-bearing — it parks the excursion band below a switch-miner's leave trigger — so this
+/// trade is the thing to watch, not the fire rate.
+///
+/// **Scope, which is not obvious from this file.** The term is added on the dense branch only.
+/// Below [`SPARSE_SPM_SEAM`] the sparse branch already widens by the count's own spread and has no
+/// `ratio_std` term, so feeding is architecturally inert at a configured rate under 6 spm — the
+/// sparse end, where σ is largest. A deployment at 4 or 5 spm gets nothing from this constant.
+pub(crate) const UNCERTAINTY_FLOOR_WEIGHT: f64 = 0.5;
+
+/// Ceiling on the reported `ratio_std`. Not a tuning parameter — a rail that keeps the loosening
+/// path reachable.
+///
+/// `ratio_std` scales as `1/√rate`, so on a channel decaying toward silence an uncapped value
+/// pushes the loosening bar past the ~100 percentage points that total silence produces, and a
+/// dead channel would be stranded at its last difficulty permanently — the estimator talking
+/// itself out of ever noticing the miner left. At `1.0` the fed floor is at most
+/// `0.05 + 0.5 = 0.55`, i.e. 55 pp, which stays under that.
+///
+/// It engages only when `λ · n_eff < 1`: below ~0.025 shares/min at τ=1200, two orders under the
+/// shipping rate, so it touches no measured figure.
+pub(crate) const MAX_REPORTED_RATIO_STD: f64 = 1.0;
 
 /// Deviation required after one minute of observation, as a fraction, on the dense branch.
 ///
@@ -272,6 +313,18 @@ pub struct VardiffState {
     /// EWMA-smoothed share rate, in shares per minute. Difficulty-relative: it is rescaled on
     /// every retarget by [`VardiffState::rescale_ewma`].
     rate: f64,
+    /// The estimator's own relative spread on [`VardiffState::rate`], recomputed every evaluation
+    /// and consumed by the dense floor via [`UNCERTAINTY_FLOOR_WEIGHT`]. `0.0` means "no usable
+    /// estimate", which leaves the floor at [`MIN_THRESHOLD_FRACTION`] exactly.
+    ///
+    /// It lives on the state, rather than being computed where it is used, because the two need
+    /// **different intervals** and pairing the wrong one is silent. The EWMA's spread is set by the
+    /// gap since the previous *evaluation* (`eval_dt`, which is also what sets its `alpha`); the
+    /// threshold is sized over the window since the previous *retarget* (`delta_time`). Those
+    /// diverge by exactly the factor by which the channel has gone unretargeted — which on a quiet
+    /// channel is the whole point of the C6b problem. So it is produced in `estimate`, where the
+    /// right interval is in scope, and only read later.
+    pub(crate) ratio_std: f64,
     /// Direction of the last evaluation's move: `+1` tightening, `-1` loosening, `0` unset.
     last_direction: i8,
     /// Direction of the last *retarget*, as distinct from the last evaluation. Kept separately
@@ -317,7 +370,8 @@ impl VardiffState {
     pub(crate) fn parameter_fingerprint() -> String {
         format!(
             "tau={}s evidence_at_1min={} reference_spm={} sparse_seam={}spm poisson_z={} \
-             min_threshold={} tighten_mult={} discount_per_obs={} max_discount={} \
+             min_threshold={} uncertainty_floor_weight={} tighten_mult={} discount_per_obs={} \
+             max_discount={} \
              step_fraction={}..{} by {} max_step_ratio={} max_silent_displacement={}",
             EWMA_TAU_SECS,
             EVIDENCE_AT_ONE_MINUTE,
@@ -325,6 +379,7 @@ impl VardiffState {
             SPARSE_SPM_SEAM,
             POISSON_Z,
             MIN_THRESHOLD_FRACTION,
+            UNCERTAINTY_FLOOR_WEIGHT,
             TIGHTEN_MULTIPLIER,
             DIRECTION_DISCOUNT_PER_OBSERVATION,
             MAX_DIRECTION_DISCOUNT,
@@ -394,6 +449,7 @@ impl VardiffState {
             consecutive_fires_same_direction: 0,
             consecutive_same_direction: 0,
             rate: 0.0,
+            ratio_std: 0.0,
             rate_seeded: false,
         })
     }
@@ -434,6 +490,70 @@ impl VardiffState {
         (-(dt_secs as f64) / (EWMA_TAU_SECS as f64)).exp()
     }
 
+    /// The EWMA's own relative spread on its smoothed rate — the quantity [`UNCERTAINTY_FLOOR_WEIGHT`]
+    /// sizes the dense floor from. Dimensionless. `0.0` when the rate carries no information.
+    ///
+    /// ## Derivation
+    ///
+    /// One evaluation observes a count `N` over `dt`, Poisson with mean `λ = r·dt/60`, and converts
+    /// it to a rate `N·60/dt`, so that single observation has relative variance `1/λ`. The EWMA is
+    /// `Σ (1−α)αᵏ obs₋ₖ`, whose variance is the observation's times `(1−α)/(1+α)`. Hence
+    ///
+    /// ```text
+    /// lambda      = rate_spm · dt_secs / 60
+    /// n_eff       = (1 + alpha) / (1 - alpha)
+    /// ratio_std   = 1 / sqrt(lambda · n_eff)
+    /// ```
+    ///
+    /// **`n_eff` is NOT `tau/dt`.** The exponential window's effective sample count for variance
+    /// is `(1+α)/(1−α)`, which at τ=1200 and a 60 s interval is 40.0, where `tau/dt` gives 20 —
+    /// using the latter would overstate σ by √2 and over-widen the floor.
+    ///
+    /// ## `dt` here is the ESTIMATOR's interval, and that is load-bearing
+    ///
+    /// Both `alpha` and `lambda` are keyed on the gap since the previous evaluation, because that
+    /// is the interval the EWMA actually smoothed over. Passing the threshold's retarget window
+    /// instead would inflate `lambda` by however long the channel had gone unretargeted and report
+    /// a confidence the estimator never had — largest on exactly the quiet, converged channels this
+    /// fix exists for. The failure would be invisible: every threshold would still look plausible.
+    ///
+    /// Note the interval is measured, not nominal, so `n_eff → 1` as `dt` grows past τ. That is
+    /// correct: a long gap means the EWMA took that one observation nearly whole, and its spread
+    /// should collapse to the single-observation `1/√λ`.
+    ///
+    /// ## Self-check
+    ///
+    /// For `dt ≪ τ`, `(1−α)/(1+α) → dt/2τ` and this collapses to `√(30/(r·τ))` — the closed form
+    /// the C6b algebra was derived from, agreeing to 0.12% at τ=360 and 0.01% at τ=1200. Asserted by
+    /// `ratio_std_reproduces_the_closed_form`, which depends on no gate, no simulation and no rig.
+    pub(crate) fn ratio_std_for(dt_secs: u64, rate_spm: f64) -> f64 {
+        if !rate_spm.is_finite() || rate_spm <= 0.0 || dt_secs == 0 {
+            return 0.0;
+        }
+        let alpha = Self::ewma_alpha(dt_secs);
+        if !(0.0..1.0).contains(&alpha) {
+            return 0.0;
+        }
+        let n_eff = (1.0 + alpha) / (1.0 - alpha);
+        let lambda = rate_spm * (dt_secs as f64 / 60.0);
+        let ratio_std = 1.0 / (lambda * n_eff).sqrt();
+        if !ratio_std.is_finite() {
+            return 0.0;
+        }
+        ratio_std.min(MAX_REPORTED_RATIO_STD)
+    }
+
+    /// The dense branch's floor, widened by the estimator's spread. Falls back to the static
+    /// [`MIN_THRESHOLD_FRACTION`] when no spread is available, so an unseeded or silent channel
+    /// behaves exactly as the unfed build does.
+    pub(crate) fn effective_floor(&self) -> f64 {
+        if self.ratio_std > 0.0 {
+            MIN_THRESHOLD_FRACTION + UNCERTAINTY_FLOOR_WEIGHT * self.ratio_std
+        } else {
+            MIN_THRESHOLD_FRACTION
+        }
+    }
+
     /// Folds the pending share count into the EWMA and returns
     /// `(realized shares per minute, implied hashrate)`.
     ///
@@ -471,6 +591,12 @@ impl VardiffState {
         };
         self.rate_seeded = true;
         self.shares_since_last_update = 0;
+
+        // Produced here, not where it is consumed: `dt_secs` is the estimator's own interval (the
+        // gap since the previous evaluation, the same one that set `alpha` above). The threshold is
+        // sized over the retarget window instead, and the two diverge by exactly the factor by which
+        // the channel has gone unretargeted. See `ratio_std_for`.
+        self.ratio_std = Self::ratio_std_for(dt_secs, self.rate);
 
         let realized_share_per_min = self.rate;
 
@@ -530,7 +656,7 @@ impl VardiffState {
         let base = if shares_per_minute < SPARSE_SPM_SEAM {
             Self::sparse_threshold(dt_secs, shares_per_minute)
         } else {
-            Self::dense_threshold(dt_secs, shares_per_minute)
+            self.dense_threshold(dt_secs, shares_per_minute)
         };
 
         // Applied here rather than inside each branch: the direction that needs resisting does not
@@ -584,13 +710,15 @@ impl VardiffState {
     /// one minute: a shorter window then yields a proportionally higher threshold, which is what
     /// makes a separate minimum-interval guard unnecessary. A one-second window demands roughly
     /// 9000%, so noise measured over a moment cannot move the difficulty.
-    fn dense_threshold(dt_secs: u64, shares_per_minute: f32) -> f64 {
+    /// Takes `&self` (where the unfed build took neither) solely to read
+    /// [`VardiffState::ratio_std`]. The evidence term is untouched; only the floor moves.
+    fn dense_threshold(&self, dt_secs: u64, shares_per_minute: f32) -> f64 {
         let window_minutes = dt_secs as f64 / 60.0;
         if window_minutes <= 0.0 {
             return f64::INFINITY;
         }
         let spm_factor = (shares_per_minute as f64 / REFERENCE_SPM).sqrt();
-        (EVIDENCE_AT_ONE_MINUTE * spm_factor / window_minutes + MIN_THRESHOLD_FRACTION) * 100.0
+        (EVIDENCE_AT_ONE_MINUTE * spm_factor / window_minutes + self.effective_floor()) * 100.0
     }
 
     /// Moves the belief part of the way to the estimate, further on each repeat in one direction.
@@ -837,6 +965,27 @@ impl Vardiff for VardiffState {
             hashrate_delta_percentage,
             threshold,
             delta_time,
+        );
+
+        // The LIVE fingerprint for the C6b fix, and the reason it is two numbers rather than one.
+        //
+        // A parameter line proves the build was *compiled* with the fix; it cannot prove the fix
+        // *executed*. This one can be inert for a pure configuration reason — below
+        // `SPARSE_SPM_SEAM` the controller is on the sparse branch, which has no `ratio_std` term at
+        // all — so a fed arm deployed at 4 or 5 spm would behave exactly like an unfed arm and read
+        // as a clean null result. `effective` differing from `static` is the only evidence that the
+        // term is doing anything; equal values mean it is not, whatever the parameter line says.
+        //
+        // Deliberately does not contain the substring "threshold of N% over Ns": the A/B harness
+        // scrapes window lengths with that pattern and a second match would corrupt the tally.
+        debug!(
+            target: "vardiff",
+            "C6b floor: effective {:.4}% vs static {:.4}% (ratio_std {:.4}%, weight {:.2}, branch {})",
+            self.effective_floor() * 100.0,
+            MIN_THRESHOLD_FRACTION * 100.0,
+            self.ratio_std * 100.0,
+            UNCERTAINTY_FLOOR_WEIGHT,
+            if shares_per_minute < SPARSE_SPM_SEAM { "sparse (fix INERT)" } else { "dense (fix live)" },
         );
 
         if (hashrate_delta_percentage as f64) < threshold {

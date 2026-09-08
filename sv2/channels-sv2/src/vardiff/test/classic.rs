@@ -13,8 +13,9 @@ use super::{
     test_try_vardiff_with_shares_less_than_30, test_try_vardiff_with_shares_more_than_60s, Vardiff,
 };
 use crate::vardiff::classic::{
-    DIRECTION_DISCOUNT_PER_OBSERVATION, EWMA_TAU_SECS, MAX_DIRECTION_DISCOUNT, STEP_FRACTION_BASE,
-    STEP_FRACTION_GROWTH, STEP_FRACTION_MAX,
+    DIRECTION_DISCOUNT_PER_OBSERVATION, EWMA_TAU_SECS, MAX_DIRECTION_DISCOUNT,
+    MAX_REPORTED_RATIO_STD, MIN_THRESHOLD_FRACTION, STEP_FRACTION_BASE, STEP_FRACTION_GROWTH,
+    STEP_FRACTION_MAX, UNCERTAINTY_FLOOR_WEIGHT,
 };
 
 fn new_test_vardiff_state() -> Result<VardiffState, VardiffError> {
@@ -486,10 +487,28 @@ fn test_tightening_needs_more_evidence_than_loosening() {
     );
     assert_eq!(
         (tighten_window, loosen_window),
-        (945, 68),
-        "the asymmetry delays action on an 83% over-delivery from 68s to 945s; a change here is \
+        (1393, 72),
+        "the asymmetry delays action on an 83% over-delivery from 72s to 1393s; a change here is \
          a change in that cost"
     );
+    // WAS (945, 68) BEFORE THE C6b FED FLOOR. This pin did its job: the cost moved and said so.
+    //
+    // Feeding `0.5 × ratio_std` into the dense floor costs **1.47× on the tighten direction**
+    // (945s → 1393s, i.e. 15.8 min → 23.2 min) and **1.06× on loosen** (68s → 72s). Both are the
+    // floor moving, since at these windows the evidence term has largely decayed and the floor is
+    // what remains — and the tighten side pays more because `TIGHTEN_MULTIPLIER` scales the floor
+    // along with everything else.
+    //
+    // **This qualifies a published claim.** `C6_QUANTIFIED_2026_09_08.md` argued feeding "costs no
+    // reaction time at high rate, which is the property neither fixA (uniform 3×) nor fixB (14× on
+    // tighten) has." The RANKING survives and is the reason to prefer this fix — 1.47× against
+    // fixA's ~3× and fixB's 14× — but "costs no reaction time" is too strong at the shipping
+    // operating point. Say "cheapest of the three", not "free".
+    //
+    // Corroborated across instruments, which is why it is believed: simulation put the settled
+    // belief 2–3 pp further under difficulty, and `test_asymmetry_leaves_a_dead_zone_of_uncorrected_
+    // over_delivery` independently measures the dead zone widening 42% → 46%. Three readings of one
+    // mechanism — a wider floor — agreeing in sign and rough size.
 }
 
 /// The extra burden of proof attaches to the move being made, not to the observed share rate.
@@ -517,9 +536,22 @@ fn test_asymmetry_follows_the_move_not_the_share_rate() {
     let target = hash_rate_to_target((hashrate / 4.0).into(), TEST_SHARES_PER_MINUTE.into())
         .expect("valid target");
 
-    // Twice the target share rate over two minutes: 40 shares at 10 per minute expected.
-    let window = 120u64;
-    for _ in 0..40 {
+    // Twice the target share rate, over TEN minutes: 200 shares where 100 are expected.
+    //
+    // This was two minutes and 40 shares, and it passed on a 1.70 pp margin — a 50.00%
+    // deviation against a 48.30% threshold. The C6b fed floor adds `0.5 × ratio_std`, worth
+    // 1.77 pp at this operating point (20 spm realized, σ = 3.53%), which took the threshold
+    // to 50.07% and stopped this firing. The property under test did not change; the test was
+    // simply reading it off a knife edge.
+    //
+    // Lengthening the window shrinks the evidence term (`EVIDENCE_AT_ONE_MINUTE / minutes`)
+    // without touching the observed rate, so the same scenario is judged with room to spare:
+    // 50.00% against 15.41%. **And the guard binds harder than it did.** If the burden of
+    // proof were wrongly keyed on the observed rate exceeding target, the ×8 multiplier would
+    // put the bar at 123.3% and this could not fire — a 73 pp discrimination, where the old
+    // form had 1.7 pp between passing and failing for the wrong reason.
+    let window = 600u64;
+    for _ in 0..200 {
         vardiff.increment_shares_since_last_update();
     }
     clock.advance(window);
@@ -670,10 +702,29 @@ fn test_asymmetry_leaves_a_dead_zone_of_uncorrected_over_delivery() {
     );
     assert_eq!(
         (loosen, tighten),
-        (6, 42),
+        (6, 46),
         "the dead zone is a product of MIN_THRESHOLD_FRACTION and TIGHTEN_MULTIPLIER; a change \
          here moves the settled offset with it"
     );
+    // WAS (6, 42) BEFORE THE C6b FED FLOOR — the dead zone widened by 4 percentage points, from
+    // 42% to 46% of uncorrected over-delivery, while the loosening bar held at 6%.
+    //
+    // This is the cost of the fix in the units that matter most, and this test's own message
+    // predicted it: the dead zone is a product of the floor and the tighten multiplier, and the fix
+    // raises the floor. `MIN_THRESHOLD_FRACTION`'s doc says the same thing in the other direction —
+    // "widening this constant or narrowing the multiplier moves the dead zone and therefore moves
+    // the offset."
+    //
+    // So the settled offset moves with it, and the offset is load-bearing rather than an error: it
+    // parks the excursion band below the level at which a switch-miner leaves. The recorded values
+    // are −6.12% in simulation and −6.96% on hardware; simulation on the composed pipeline puts the
+    // fed version 2–3 pp deeper. **Whether ~3 pp of extra under-difficulty is worth buying
+    // `floor/σ ≥ 1` is a policy call, not a derivation**, and it is the question phase 2 should be
+    // read against — not the fire rate, which is the easy half.
+    //
+    // Asymmetric on purpose: 6% → 6% means the fix does NOT dull the loosening path, the direction
+    // that strands a slowing miner. It buys quiet in the direction that can compound and leaves the
+    // safety-relevant direction alone.
 }
 
 // The discount must change a *decision*, not just a counter. A persistent shortfall evaluated every
@@ -941,4 +992,147 @@ fn test_parameter_fingerprint_carries_the_constants() {
             "fingerprint is missing or has drifted from `{expected}`: {f}"
         );
     }
+}
+
+// ── C6b: the fed dense floor ────────────────────────────────────────────────────
+//
+// The shipping operating point these assert against: `shares_per_minute = 6.0`
+// configured, realized ~8.26 spm after the pow2 floor at the SV1 egress. Naming the
+// operating point, because every figure that moved in this arc was one quoted
+// without one.
+const SHIPPING_REALIZED_SPM: f64 = 8.26;
+
+/// The check that depends on no gate, no simulation and no rig: the producer must
+/// reproduce the closed form the C6b algebra was derived from, `sigma ~ sqrt(30/(r*tau))`.
+/// If this drifts, the published floor/sigma table stops describing this code.
+#[test]
+fn ratio_std_reproduces_the_closed_form() {
+    let dt = 60u64;
+    let sigma = VardiffState::ratio_std_for(dt, SHIPPING_REALIZED_SPM);
+
+    // Exact: 1/sqrt(lambda * n_eff).
+    let alpha = (-(dt as f64) / (EWMA_TAU_SECS as f64)).exp();
+    let n_eff = (1.0 + alpha) / (1.0 - alpha);
+    let lambda = SHIPPING_REALIZED_SPM * (dt as f64 / 60.0);
+    let exact = 1.0 / (lambda * n_eff).sqrt();
+    assert!(
+        (sigma - exact).abs() < 1e-12,
+        "ratio_std {sigma} must be the exact EWMA form {exact}"
+    );
+
+    // Asymptotic: the dt << tau collapse the algebra used. tau=1200 agrees to 0.01%,
+    // tau=360 to 0.12%; assert the looser bound so this test is tau-agnostic.
+    let asymptotic = (30.0 / (SHIPPING_REALIZED_SPM * EWMA_TAU_SECS as f64)).sqrt();
+    let disagreement = (sigma / asymptotic - 1.0).abs();
+    assert!(
+        disagreement < 0.0013,
+        "exact {sigma} vs closed form {asymptotic} disagree by {:.4}%, over the 0.12% claimed",
+        disagreement * 100.0
+    );
+}
+
+/// `n_eff` is `(1+alpha)/(1-alpha)`, NOT `tau/dt`. Using `tau/dt` would overstate
+/// sigma by ~sqrt(2) and over-widen the floor, so pin the distinction.
+#[test]
+fn effective_sample_count_is_not_tau_over_dt() {
+    let dt = 60u64;
+    let alpha = (-(dt as f64) / (EWMA_TAU_SECS as f64)).exp();
+    let n_eff = (1.0 + alpha) / (1.0 - alpha);
+    let naive = EWMA_TAU_SECS as f64 / dt as f64;
+    assert!(
+        (n_eff / naive - 2.0).abs() < 0.01,
+        "n_eff {n_eff} should be ~2x the naive tau/dt {naive} — if this stops holding, \
+         re-derive rather than adjusting the bound"
+    );
+}
+
+/// The margin this fix is bought for: `floor/sigma` must clear 1.0 — the boundary above
+/// which noise-driven firing is algebraically impossible rather than merely rarer.
+/// Unfed it is 0.50 at tau=360 and 0.91 at tau=1200; fed it gains exactly the weight.
+#[test]
+fn fed_floor_clears_the_no_hunting_boundary() {
+    let sigma = VardiffState::ratio_std_for(60, SHIPPING_REALIZED_SPM);
+    let unfed_margin = MIN_THRESHOLD_FRACTION / sigma;
+    let fed_margin = (MIN_THRESHOLD_FRACTION + UNCERTAINTY_FLOOR_WEIGHT * sigma) / sigma;
+
+    // Feeding adds exactly the weight to the margin, at every rate. That rate-independence
+    // is the property a larger MIN_THRESHOLD_FRACTION would not have.
+    assert!(
+        (fed_margin - unfed_margin - UNCERTAINTY_FLOOR_WEIGHT).abs() < 1e-9,
+        "fed margin {fed_margin} should be unfed {unfed_margin} + {UNCERTAINTY_FLOOR_WEIGHT}"
+    );
+    assert!(
+        fed_margin >= 1.0,
+        "fed margin {fed_margin} must reach the floor>=sigma no-hunting boundary at the \
+         shipping rate; unfed was {unfed_margin}"
+    );
+}
+
+/// A silent or unseeded channel must behave EXACTLY as the unfed build does, so an arm
+/// that loses its miner does not quietly become a different controller.
+#[test]
+fn no_estimate_means_the_static_floor_exactly() {
+    assert_eq!(VardiffState::ratio_std_for(60, 0.0), 0.0);
+    assert_eq!(VardiffState::ratio_std_for(60, -1.0), 0.0);
+    assert_eq!(VardiffState::ratio_std_for(0, 8.26), 0.0);
+    assert_eq!(VardiffState::ratio_std_for(60, f64::NAN), 0.0);
+    let s = new_test_vardiff_state().unwrap();
+    assert_eq!(s.ratio_std, 0.0, "a fresh state reports no spread");
+    assert_eq!(
+        s.effective_floor(),
+        MIN_THRESHOLD_FRACTION,
+        "with no spread the floor must be the static one, bit for bit"
+    );
+}
+
+/// The rail, not a tuning knob: sigma scales as 1/sqrt(rate), so an uncapped value would
+/// push the loosening bar past the ~100pp that total silence produces and strand a dead
+/// channel at its last difficulty for good.
+#[test]
+fn ratio_std_is_capped_so_loosening_stays_reachable() {
+    let sigma = VardiffState::ratio_std_for(60, 1.0e-9);
+    assert_eq!(sigma, MAX_REPORTED_RATIO_STD);
+    let fed_floor_pp = (MIN_THRESHOLD_FRACTION + UNCERTAINTY_FLOOR_WEIGHT * sigma) * 100.0;
+    assert!(
+        fed_floor_pp < 100.0,
+        "the fed loosening bar reached {fed_floor_pp}pp; silence yields ~100pp, so the \
+         loosen fire must stay reachable below it"
+    );
+    // And it must not bind anywhere in the measured band, or it would be a parameter of
+    // the result rather than a rail under it.
+    for &r in &[4.0, 6.0, SHIPPING_REALIZED_SPM, 12.0, 20.0, 30.0, 60.0] {
+        assert!(
+            VardiffState::ratio_std_for(60, r) < MAX_REPORTED_RATIO_STD,
+            "the cap binds at {r} spm — it must not touch the band"
+        );
+    }
+}
+
+/// The interval matters and pairing the wrong one is silent. `ratio_std` must be keyed on
+/// the ESTIMATOR's interval; feeding it a long retarget window instead would report a
+/// confidence the estimator never had, and would do so most on the quiet converged
+/// channels this fix exists for.
+#[test]
+fn a_longer_interval_reports_more_confidence_so_the_wrong_one_understates_the_floor() {
+    let short = VardiffState::ratio_std_for(60, SHIPPING_REALIZED_SPM);
+    let long = VardiffState::ratio_std_for(1800, SHIPPING_REALIZED_SPM);
+    assert!(
+        long < short,
+        "a 30-minute interval ({long}) must read as more confident than a 1-minute one \
+         ({short}) — so using the retarget window in place of the evaluation gap would \
+         silently shrink the floor exactly where C6b needs it widened"
+    );
+}
+
+/// The fingerprint must carry the new constant, or a fed build is indistinguishable from
+/// an unfed one in the logs — and the A/B's identity check keys on this line.
+#[test]
+fn fingerprint_carries_the_uncertainty_weight() {
+    let f = VardiffState::parameter_fingerprint();
+    assert!(
+        f.contains(&format!(
+            "uncertainty_floor_weight={UNCERTAINTY_FLOOR_WEIGHT}"
+        )),
+        "fingerprint must name the C6b weight so a fed arm is attributable: {f}"
+    );
 }
