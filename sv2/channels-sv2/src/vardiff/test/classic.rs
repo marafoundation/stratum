@@ -1,7 +1,8 @@
 /// Classic implementation test suite
+use crate::vardiff::clock::MockClock;
 use crate::vardiff::test::{
-    simulate_shares_and_wait, TEST_INITIAL_HASHRATE, TEST_MIN_ALLOWED_HASHRATE,
-    TEST_SHARES_PER_MINUTE,
+    deliver_and_advance, simulate_shares_and_wait, TEST_INITIAL_HASHRATE,
+    TEST_MIN_ALLOWED_HASHRATE, TEST_SHARES_PER_MINUTE,
 };
 use crate::{target::hash_rate_to_target, vardiff::VardiffError, VardiffState};
 
@@ -19,6 +20,15 @@ use crate::vardiff::classic::{
 
 fn new_test_vardiff_state() -> Result<VardiffState, VardiffError> {
     VardiffState::new_with_min(TEST_MIN_ALLOWED_HASHRATE)
+}
+
+/// As [`new_test_vardiff_state`] but on a [`MockClock`], for tests whose retarget window must
+/// accumulate across evaluations rather than being pinned. Pair with `deliver_and_advance`.
+fn new_clocked_test_vardiff_state() -> (VardiffState, std::sync::Arc<MockClock>) {
+    let clock = std::sync::Arc::new(MockClock::new(1_000_000));
+    let vardiff = VardiffState::new_with_clock(TEST_MIN_ALLOWED_HASHRATE, clock.clone())
+        .expect("Failed to create VardiffState");
+    (vardiff, clock)
 }
 
 #[test]
@@ -189,7 +199,9 @@ fn test_new_with_min_rejects_unusable_floor() {
 // until vardiff climbs back.
 #[test]
 fn test_silent_channel_ease_displacement_is_bounded() {
-    let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+    // Clocked: the window must grow across the silent evaluations, as it does in production when
+    // the controller declines to act. On the rewinding helper the bar is frozen at 61 s forever.
+    let (mut vardiff, clock) = new_clocked_test_vardiff_state();
     let mut hashrate = TEST_INITIAL_HASHRATE;
     let target =
         hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
@@ -197,7 +209,7 @@ fn test_silent_channel_ease_displacement_is_bounded() {
     // Forty consecutive silent evaluations. Unbounded, the ~4 that carry
     // TEST_INITIAL_HASHRATE down to TEST_MIN_ALLOWED_HASHRATE are spent in the first few.
     for _ in 0..40 {
-        simulate_shares_and_wait(&mut vardiff, 0, 61);
+        deliver_and_advance(&mut vardiff, &clock, 0, 61);
         if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
             hashrate = updated;
         }
@@ -221,14 +233,15 @@ fn test_silent_channel_ease_displacement_is_bounded() {
 // and stop easing for a genuine decline.
 #[test]
 fn test_share_activity_rearms_the_silence_bound() {
-    let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+    // Clocked, for the same reason as the displacement test above.
+    let (mut vardiff, clock) = new_clocked_test_vardiff_state();
     let mut hashrate = TEST_INITIAL_HASHRATE;
     let mut target =
         hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
 
     // 1. Sustained silence settles at the bound: 9x below the belief that last had evidence.
     for _ in 0..40 {
-        simulate_shares_and_wait(&mut vardiff, 0, 61);
+        deliver_and_advance(&mut vardiff, &clock, 0, 61);
         if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
             hashrate = updated;
             target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
@@ -242,7 +255,7 @@ fn test_share_activity_rearms_the_silence_bound() {
     );
 
     // 2. Evidence arrives at the lowered belief, re-anchoring the bound to it.
-    simulate_shares_and_wait(&mut vardiff, TEST_SHARES_PER_MINUTE as u32, 61);
+    deliver_and_advance(&mut vardiff, &clock, TEST_SHARES_PER_MINUTE as u32, 61);
     if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
         hashrate = updated;
         target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
@@ -254,7 +267,7 @@ fn test_share_activity_rearms_the_silence_bound() {
     //    last evidenced belief rather than an absolute floor. Without the re-anchor the channel
     //    would be stuck at `first_bound` forever, unable to follow a miner that really had slowed.
     for _ in 0..40 {
-        simulate_shares_and_wait(&mut vardiff, 0, 61);
+        deliver_and_advance(&mut vardiff, &clock, 0, 61);
         if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
             hashrate = updated;
             target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
@@ -830,14 +843,15 @@ fn test_no_evaluation_moves_the_belief_past_the_step_bound() {
         ),
         ("a collapse to near nothing", 1),
     ] {
-        let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+        // Clocked: the window accumulates, so the bar decays as it does in production.
+        let (mut vardiff, clock) = new_clocked_test_vardiff_state();
         let mut hashrate = TEST_INITIAL_HASHRATE;
         let mut widest = 1.0_f32;
 
         for _ in 0..40 {
             let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
                 .expect("valid target");
-            simulate_shares_and_wait(&mut vardiff, delivered, 61);
+            deliver_and_advance(&mut vardiff, &clock, delivered, 61);
             if let Ok(Some(updated)) =
                 vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
             {
@@ -866,14 +880,15 @@ fn test_no_evaluation_moves_the_belief_past_the_step_bound() {
 fn test_the_step_bound_does_not_slow_the_response_to_a_decline() {
     for (label, surviving_fraction) in [("half", 0.5_f32), ("a tenth", 0.1), ("a hundredth", 0.01)]
     {
-        let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+        // Clocked, so the bar decays across the settle and observe phases as production does.
+        let (mut vardiff, clock) = new_clocked_test_vardiff_state();
         let mut hashrate = TEST_INITIAL_HASHRATE;
 
         // Settle first: an on-target half hour, so the decline starts from a converged belief.
         for _ in 0..30 {
             let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
                 .expect("valid target");
-            simulate_shares_and_wait(&mut vardiff, TEST_SHARES_PER_MINUTE as u32, 61);
+            deliver_and_advance(&mut vardiff, &clock, TEST_SHARES_PER_MINUTE as u32, 61);
             if let Ok(Some(updated)) =
                 vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
             {
@@ -887,7 +902,7 @@ fn test_the_step_bound_does_not_slow_the_response_to_a_decline() {
         for _ in 0..120 {
             let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
                 .expect("valid target");
-            simulate_shares_and_wait(&mut vardiff, delivered, 61);
+            deliver_and_advance(&mut vardiff, &clock, delivered, 61);
             if let Ok(Some(updated)) =
                 vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE)
             {

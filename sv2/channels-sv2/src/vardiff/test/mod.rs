@@ -6,6 +6,7 @@ mod classic;
 
 use super::Vardiff;
 use crate::target::hash_rate_to_target;
+use crate::vardiff::clock::MockClock;
 use bitcoin::Target;
 
 pub const TEST_INITIAL_HASHRATE: f32 = 1000.0;
@@ -32,6 +33,29 @@ pub fn simulate_shares_and_wait<V: Vardiff>(
         - wait_duration_secs;
 
     vardiff.set_timestamp_of_last_update(now);
+}
+
+/// Delivers `num_shares` and advances a [`MockClock`] by `secs`, letting the retarget window
+/// **accumulate** across evaluations.
+///
+/// The counterpart to [`simulate_shares_and_wait`], and the one to reach for in a loop.
+/// `simulate_shares_and_wait` rewinds `timestamp_of_last_update` on every call, which pins the
+/// retarget window to exactly `wait_duration_secs` however many times it is called. That is correct
+/// when a test wants one specific window length, and wrong when a test wants "the window grew
+/// because the controller declined to act" — the window the shipped controller actually sees, and
+/// the thing patch 2's injectable clock exists to express. A test that loops on the rewinding
+/// helper scores a controller whose bar never decays, so a change to the threshold's shape shows up
+/// there as a failure that says nothing about production.
+pub fn deliver_and_advance<V: Vardiff>(
+    vardiff: &mut V,
+    clock: &MockClock,
+    num_shares: u32,
+    secs: u64,
+) {
+    for _ in 0..num_shares {
+        vardiff.increment_shares_since_last_update();
+    }
+    clock.advance(secs);
 }
 
 // Verifies that the share counter can be incremented and reset correctly.
