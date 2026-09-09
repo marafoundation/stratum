@@ -944,10 +944,11 @@ impl Vardiff for VardiffState {
 
         debug!(
             target: "vardiff",
-            "Calculated new hashrate: {:.2} H/s (Δ {:.2}%, previous {:.2} H/s)",
+            "Calculated new hashrate: {:.2} H/s (Δ {:.2}%, previous {:.2} H/s, anchor {:.2} H/s)",
             new_hashrate,
             hashrate_delta_percentage,
             hashrate,
+            self.evidenced_hashrate,
         );
 
         let tightening = estimated_hashrate > hashrate;
