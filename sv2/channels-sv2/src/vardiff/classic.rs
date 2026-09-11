@@ -22,7 +22,7 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 ///
 /// Binds only while evidence is absent: [`VardiffState::evidenced_hashrate`] re-anchors whenever
 /// shares arrive, so a genuinely declining miner, which still submits, is never held back by it.
-const MAX_SILENT_DISPLACEMENT: f32 = 9.0;
+pub(crate) const MAX_SILENT_DISPLACEMENT: f32 = 9.0;
 
 /// Share rate below which the decision threshold is sized from a Poisson interval rather than a
 /// sequential test, in shares per minute.
@@ -129,7 +129,7 @@ const REFERENCE_SPM: f64 = 30.0;
 /// regardless of difficulty, was farmed: Bitcoin Cash's Emergency Difficulty Adjustment shipped in
 /// August 2017 and was replaced within months. The mechanism is not safe in general; it is safe
 /// under this accounting.
-const TIGHTEN_MULTIPLIER: f64 = 8.0;
+pub(crate) const TIGHTEN_MULTIPLIER: f64 = 8.0;
 
 /// How much the threshold relaxes per extra observation pointing the same way, as a fraction.
 ///
@@ -144,13 +144,6 @@ pub(crate) const DIRECTION_DISCOUNT_PER_OBSERVATION: f64 = 0.06;
 /// Without a ceiling a long run would drive the threshold to zero and the controller would act on
 /// noise indefinitely.
 pub(crate) const MAX_DIRECTION_DISCOUNT: f64 = 0.6;
-
-/// Run length at which the discount reaches [`MAX_DIRECTION_DISCOUNT`].
-///
-/// The stored run is clamped here. Counting past the point where the count changes nothing would
-/// keep state whose value is never read.
-const DIRECTION_RUN_AT_MAX_DISCOUNT: u32 =
-    1 + (MAX_DIRECTION_DISCOUNT / DIRECTION_DISCOUNT_PER_OBSERVATION) as u32;
 
 /// Fraction of the gap to the new estimate that a first retarget closes.
 ///
@@ -228,7 +221,7 @@ const RUN_AT_MAX_STEP_FRACTION: u32 =
 /// size cannot, because each step is individually warranted by the evidence in front of it.
 /// Recognising that raising the difficulty is not reducing the share rate is a separate mechanism,
 /// and is not attempted here.
-const MAX_STEP_RATIO: f32 = 2.0;
+pub(crate) const MAX_STEP_RATIO: f32 = 2.0;
 
 /// Time constant of the EWMA estimator, in seconds.
 ///
@@ -265,6 +258,138 @@ const MAX_STEP_RATIO: f32 = 2.0;
 /// noise-driven retargeting rather than removing it; removing it needs a decision timescale
 /// separate from the move timescale, which is not attempted here.
 pub(crate) const EWMA_TAU_SECS: u64 = 1200;
+
+/// The parameters a **diagnostic** build may override at runtime, and the seam that reads them.
+///
+/// Every value here has a `const` above it that is the shipped default and the only value a
+/// default build can hold. The `vardiff-tunable` feature adds one thing: each accessor consults
+/// `VARDIFF_<NAME>` in the environment once per process, falling back to that same const.
+///
+/// ## Why this exists
+///
+/// The deployed A/B ran its two arms as two *commits*, and diffing them shows the arms differed by
+/// **two** things at once — `EWMA_TAU_SECS` 360 vs 1200 *and* the presence of the C6b fed floor
+/// (`UNCERTAINTY_FLOOR_WEIGHT`, `ratio_std`, [`VardiffState::effective_floor`]). A rate ratio
+/// attributed to one of two simultaneous changes is not a measurement of either, and the effect
+/// sizes are comparable: the fed arm's floor runs at a measured 8.18% against the unfed arm's
+/// static 5.00%, on a contrast reported as a τ contrast. One binary plus one variable per arm makes
+/// exactly one parameter differ, by construction rather than by inspection of a diff.
+///
+/// It also makes two quantities measurable that were not. The deadband exponent `k` in
+/// `fires/h = C·exp(−k·a²/2)` needs `a` swept at fixed τ, which needed a rebuild per point; and
+/// whether the ease bound is *bindable* or merely never reached needs `MAX_STEP_RATIO` raised,
+/// since the step bound and not the anchor is what holds the ease. Both become schedulable on one
+/// image.
+///
+/// ## Why it is feature-gated
+///
+/// Controller constants that answer to the environment are a footgun in a pool nobody is watching,
+/// and the harm is silent — a stray variable changes the decision boundary and every log line
+/// still looks plausible. A default build cannot read them at all: without the feature the
+/// accessors below are `const fn`s returning the constant, so the override path does not exist in
+/// the binary rather than merely being unset.
+///
+/// ## What makes an override observable
+///
+/// [`VardiffState::parameter_fingerprint`] is formatted from these accessors, not from the
+/// constants, so the emitted parameter line reports the **effective** vector. Combined with the
+/// hourly re-emit that is what makes an arm's identity readable from its own logs instead of from a
+/// commit hash held elsewhere.
+pub(crate) mod params {
+    use super::{
+        DIRECTION_DISCOUNT_PER_OBSERVATION, EWMA_TAU_SECS, MAX_DIRECTION_DISCOUNT,
+        MAX_SILENT_DISPLACEMENT, MAX_STEP_RATIO, MIN_THRESHOLD_FRACTION, TIGHTEN_MULTIPLIER,
+        UNCERTAINTY_FLOOR_WEIGHT,
+    };
+
+    /// Parses one override value, keeping `default` if it does not parse, and reports which
+    /// happened at `warn!` under the name the operator set.
+    ///
+    /// Deliberately **not** feature-gated, unlike [`from_env`], and split out from it for one
+    /// reason: this is the half that can be wrong, and a test can only reach it if it exists in
+    /// every build. An unparsable value keeps the default rather than failing the process — a typo
+    /// in a deploy variable should not take a pool down — but it must not pass silently either,
+    /// because an override that did not take is the one failure mode that looks exactly like a
+    /// successful null result.
+    #[cfg_attr(not(feature = "vardiff-tunable"), allow(dead_code))]
+    pub(crate) fn parse_or_default<T>(name: &str, raw: &str, default: T) -> T
+    where
+        T: core::str::FromStr + Copy + core::fmt::Display,
+    {
+        match raw.trim().parse::<T>() {
+            Ok(v) => {
+                tracing::warn!(
+                    target: "vardiff",
+                    "DIAGNOSTIC OVERRIDE {}={} (default {})", name, v, default,
+                );
+                v
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "vardiff",
+                    "DIAGNOSTIC OVERRIDE {}={:?} is unparsable; keeping default {}",
+                    name, raw, default,
+                );
+                default
+            }
+        }
+    }
+
+    /// Reads `name` from the environment once, falling back to `default` when it is unset.
+    #[cfg(feature = "vardiff-tunable")]
+    fn from_env<T>(name: &str, default: T) -> T
+    where
+        T: core::str::FromStr + Copy + core::fmt::Display,
+    {
+        match std::env::var(name) {
+            Ok(raw) => parse_or_default(name, &raw, default),
+            Err(_) => default,
+        }
+    }
+
+    /// Emits both arms of each accessor from one declaration, so the overridable name, its
+    /// environment variable and its default cannot drift apart across a `cfg`.
+    macro_rules! tunables {
+        ($( fn $name:ident() -> $ty:ty = $konst:ident @ $env:literal; )*) => {
+            $(
+                #[cfg(feature = "vardiff-tunable")]
+                pub(crate) fn $name() -> $ty {
+                    static CELL: std::sync::OnceLock<$ty> = std::sync::OnceLock::new();
+                    *CELL.get_or_init(|| from_env($env, $konst))
+                }
+
+                #[cfg(not(feature = "vardiff-tunable"))]
+                pub(crate) const fn $name() -> $ty {
+                    $konst
+                }
+            )*
+        };
+    }
+
+    tunables! {
+        fn tau_secs() -> u64 = EWMA_TAU_SECS @ "VARDIFF_EWMA_TAU_SECS";
+        fn min_threshold_fraction() -> f64 = MIN_THRESHOLD_FRACTION @ "VARDIFF_MIN_THRESHOLD_FRACTION";
+        fn uncertainty_floor_weight() -> f64 = UNCERTAINTY_FLOOR_WEIGHT @ "VARDIFF_UNCERTAINTY_FLOOR_WEIGHT";
+        fn tighten_multiplier() -> f64 = TIGHTEN_MULTIPLIER @ "VARDIFF_TIGHTEN_MULTIPLIER";
+        fn max_direction_discount() -> f64 = MAX_DIRECTION_DISCOUNT @ "VARDIFF_MAX_DIRECTION_DISCOUNT";
+        fn max_step_ratio() -> f32 = MAX_STEP_RATIO @ "VARDIFF_MAX_STEP_RATIO";
+        fn max_silent_displacement() -> f32 = MAX_SILENT_DISPLACEMENT @ "VARDIFF_MAX_SILENT_DISPLACEMENT";
+    }
+
+    /// Run length at which the discount reaches [`max_direction_discount`].
+    ///
+    /// The stored run is clamped here. Counting past the point where the count changes nothing
+    /// would keep state whose value is never read.
+    ///
+    /// Derived rather than declared, and therefore not itself overridable: it was a `const`
+    /// computed from the two constants below it, and making the discount ceiling settable turns
+    /// that computation into a function of the effective value. Leaving it a `const` would have
+    /// clamped the run at the *default* ceiling while the discount used the overridden one, so a
+    /// swept discount would have silently stopped taking effect past `0.6`.
+    pub(crate) fn direction_run_at_max_discount() -> u32 {
+        1 + (max_direction_discount() / DIRECTION_DISCOUNT_PER_OBSERVATION) as u32
+    }
+}
 
 use super::{
     clock::{Clock, SystemClock},
@@ -373,21 +498,21 @@ impl VardiffState {
              min_threshold={} uncertainty_floor_weight={} tighten_mult={} discount_per_obs={} \
              max_discount={} \
              step_fraction={}..{} by {} max_step_ratio={} max_silent_displacement={}",
-            EWMA_TAU_SECS,
+            params::tau_secs(),
             EVIDENCE_AT_ONE_MINUTE,
             REFERENCE_SPM,
             SPARSE_SPM_SEAM,
             POISSON_Z,
-            MIN_THRESHOLD_FRACTION,
-            UNCERTAINTY_FLOOR_WEIGHT,
-            TIGHTEN_MULTIPLIER,
+            params::min_threshold_fraction(),
+            params::uncertainty_floor_weight(),
+            params::tighten_multiplier(),
             DIRECTION_DISCOUNT_PER_OBSERVATION,
-            MAX_DIRECTION_DISCOUNT,
+            params::max_direction_discount(),
             STEP_FRACTION_BASE,
             STEP_FRACTION_MAX,
             STEP_FRACTION_GROWTH,
-            MAX_STEP_RATIO,
-            MAX_SILENT_DISPLACEMENT,
+            params::max_step_ratio(),
+            params::max_silent_displacement(),
         )
     }
 
@@ -487,7 +612,7 @@ impl VardiffState {
     /// silently altering its memory. This is the same reason `tau` is parameterised in seconds
     /// rather than in evaluations.
     fn ewma_alpha(dt_secs: u64) -> f64 {
-        (-(dt_secs as f64) / (EWMA_TAU_SECS as f64)).exp()
+        (-(dt_secs as f64) / (params::tau_secs() as f64)).exp()
     }
 
     /// The EWMA's own relative spread on its smoothed rate — the quantity [`UNCERTAINTY_FLOOR_WEIGHT`]
@@ -548,9 +673,9 @@ impl VardiffState {
     /// behaves exactly as the unfed build does.
     pub(crate) fn effective_floor(&self) -> f64 {
         if self.ratio_std > 0.0 {
-            MIN_THRESHOLD_FRACTION + UNCERTAINTY_FLOOR_WEIGHT * self.ratio_std
+            params::min_threshold_fraction() + params::uncertainty_floor_weight() * self.ratio_std
         } else {
-            MIN_THRESHOLD_FRACTION
+            params::min_threshold_fraction()
         }
     }
 
@@ -623,7 +748,7 @@ impl VardiffState {
         let direction: i8 = if tightening { 1 } else { -1 };
         if direction == self.last_direction {
             self.consecutive_same_direction =
-                (self.consecutive_same_direction + 1).min(DIRECTION_RUN_AT_MAX_DISCOUNT);
+                (self.consecutive_same_direction + 1).min(params::direction_run_at_max_discount());
         } else {
             self.last_direction = direction;
             self.consecutive_same_direction = 1;
@@ -668,7 +793,7 @@ impl VardiffState {
         // if they disagree, deciding from the rate would apply the extra burden of proof to a
         // loosening move and withhold it from a tightening one, inverting the property.
         let directional = if tightening {
-            base * TIGHTEN_MULTIPLIER
+            base * params::tighten_multiplier()
         } else {
             base
         };
@@ -678,7 +803,7 @@ impl VardiffState {
         // the tightening multiplier: at the ceiling an 8x requirement becomes 3.2x.
         let discount = (DIRECTION_DISCOUNT_PER_OBSERVATION
             * same_direction_run.saturating_sub(1) as f64)
-            .min(MAX_DIRECTION_DISCOUNT);
+            .min(params::max_direction_discount());
         directional * (1.0 - discount)
     }
 
@@ -699,7 +824,7 @@ impl VardiffState {
             // No evidence can arrive in a zero-length window; refuse to act.
             return f64::INFINITY;
         }
-        ((POISSON_Z * lambda.sqrt() + 0.5) / lambda + MIN_THRESHOLD_FRACTION) * 100.0
+        ((POISSON_Z * lambda.sqrt() + 0.5) / lambda + params::min_threshold_fraction()) * 100.0
     }
 
     /// Dense branch: require a fixed deviation after one minute, relaxed in proportion to the
@@ -983,9 +1108,9 @@ impl Vardiff for VardiffState {
             target: "vardiff",
             "C6b floor: effective {:.4}% vs static {:.4}% (ratio_std {:.4}%, weight {:.2}, branch {})",
             self.effective_floor() * 100.0,
-            MIN_THRESHOLD_FRACTION * 100.0,
+            params::min_threshold_fraction() * 100.0,
             self.ratio_std * 100.0,
-            UNCERTAINTY_FLOOR_WEIGHT,
+            params::uncertainty_floor_weight(),
             if shares_per_minute < SPARSE_SPM_SEAM { "sparse (fix INERT)" } else { "dense (fix live)" },
         );
 
@@ -1016,12 +1141,13 @@ impl Vardiff for VardiffState {
 
         // Bound the move itself, in both directions. One window of evidence does not warrant an
         // unbounded change of belief, however large the deviation it reports.
-        let bounded = new_hashrate.clamp(hashrate / MAX_STEP_RATIO, hashrate * MAX_STEP_RATIO);
+        let max_step_ratio = params::max_step_ratio();
+        let bounded = new_hashrate.clamp(hashrate / max_step_ratio, hashrate * max_step_ratio);
         if bounded != new_hashrate {
             debug!(
                 target: "vardiff",
                 "Move bounded to {:.0}x per evaluation: {:.2} -> {:.2} H/s",
-                MAX_STEP_RATIO,
+                max_step_ratio,
                 new_hashrate,
                 bounded,
             );
@@ -1034,12 +1160,12 @@ impl Vardiff for VardiffState {
         // at `MAX_SILENT_DISPLACEMENT` for any estimator. Only downward movement is constrained,
         // and only while `evidenced_hashrate` is stale — any share re-anchors it above.
         if pending_shares == 0 && self.evidenced_hashrate > 0.0 {
-            let silent_floor = self.evidenced_hashrate / MAX_SILENT_DISPLACEMENT;
+            let silent_floor = self.evidenced_hashrate / params::max_silent_displacement();
             if new_hashrate < silent_floor {
                 debug!(
                     target: "vardiff",
                     "Ease bounded at {:.0}x below the last evidenced belief: {:.2} -> {:.2} H/s",
-                    MAX_SILENT_DISPLACEMENT,
+                    params::max_silent_displacement(),
                     new_hashrate,
                     silent_floor,
                 );

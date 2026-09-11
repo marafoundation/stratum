@@ -1136,3 +1136,89 @@ fn fingerprint_carries_the_uncertainty_weight() {
         "fingerprint must name the C6b weight so a fed arm is attributable: {f}"
     );
 }
+
+// ── The runtime-override seam ───────────────────────────────────────────────────
+//
+// Three properties, and each corresponds to a way this seam can fail while every log
+// line still looks plausible.
+
+/// A default build must be byte-for-byte the controller it was before the seam existed.
+///
+/// The accessors exist in both builds; only their bodies differ. So the property that makes the
+/// feature safe to add to a shipping lineage is that *without* the feature every accessor returns
+/// its constant — which is checkable, and is checked here rather than argued from the `cfg`.
+#[test]
+fn params_default_to_the_shipped_constants() {
+    use crate::vardiff::classic::params;
+    use crate::vardiff::classic::{MAX_SILENT_DISPLACEMENT, MAX_STEP_RATIO, TIGHTEN_MULTIPLIER};
+
+    // Under the feature these hold only while no `VARDIFF_*` variable is set, which is the
+    // condition a shipping deployment is in anyway. The assertion is the same either way.
+    assert_eq!(params::tau_secs(), EWMA_TAU_SECS);
+    assert_eq!(params::min_threshold_fraction(), MIN_THRESHOLD_FRACTION);
+    assert_eq!(params::uncertainty_floor_weight(), UNCERTAINTY_FLOOR_WEIGHT);
+    assert_eq!(params::tighten_multiplier(), TIGHTEN_MULTIPLIER);
+    assert_eq!(params::max_direction_discount(), MAX_DIRECTION_DISCOUNT);
+    assert_eq!(params::max_step_ratio(), MAX_STEP_RATIO);
+    assert_eq!(params::max_silent_displacement(), MAX_SILENT_DISPLACEMENT);
+}
+
+/// The run clamp must follow the *effective* discount ceiling, not the default one.
+///
+/// This is the one derived quantity in the set: it was a `const` computed from
+/// `MAX_DIRECTION_DISCOUNT`, and leaving it a `const` would have clamped the same-direction run at
+/// the default ceiling while `threshold` discounted against an overridden one. A swept discount
+/// would then have stopped taking effect above `0.6` with nothing in the logs to show it — the
+/// clamp is invisible, only its consequence is. Asserted as the relationship rather than as `11`,
+/// so it holds at any ceiling.
+#[test]
+fn direction_run_clamp_follows_the_effective_ceiling() {
+    use crate::vardiff::classic::params;
+
+    let expected =
+        1 + (params::max_direction_discount() / DIRECTION_DISCOUNT_PER_OBSERVATION) as u32;
+    assert_eq!(params::direction_run_at_max_discount(), expected);
+
+    // And at the shipped ceiling it is the value the discount arithmetic saturates at: the run
+    // reaching this length is exactly when `discount == max_direction_discount`.
+    let at_clamp =
+        DIRECTION_DISCOUNT_PER_OBSERVATION * (params::direction_run_at_max_discount() - 1) as f64;
+    assert!(
+        at_clamp >= params::max_direction_discount(),
+        "the clamp must be reached no earlier than the discount ceiling, else the last \
+         observations of a run buy nothing: clamp reaches {at_clamp}, ceiling {}",
+        params::max_direction_discount()
+    );
+}
+
+/// An unparsable override keeps the default; a parsable one is taken; whitespace is tolerated.
+///
+/// The failure mode being guarded is silent: `VARDIFF_EWMA_TAU_SECS=360s` (with the unit) does not
+/// parse as `u64`, and if that returned `0` or panicked-then-defaulted without saying so, the arm
+/// would run at 1200 while the deploy record said 360. Reachable in every build because
+/// `parse_or_default` is not itself feature-gated — a guard behind the same `cfg` as the code it
+/// guards is a guard the default test run never executes.
+#[test]
+fn an_unparsable_override_keeps_the_default() {
+    use crate::vardiff::classic::params::parse_or_default;
+
+    assert_eq!(
+        parse_or_default("VARDIFF_EWMA_TAU_SECS", "360", 1200u64),
+        360
+    );
+    assert_eq!(
+        parse_or_default("VARDIFF_EWMA_TAU_SECS", "  360\n", 1200u64),
+        360
+    );
+    assert_eq!(
+        parse_or_default("VARDIFF_EWMA_TAU_SECS", "360s", 1200u64),
+        1200,
+        "a value carrying its unit must not be read as a number"
+    );
+    assert_eq!(parse_or_default("VARDIFF_EWMA_TAU_SECS", "", 1200u64), 1200);
+    assert_eq!(
+        parse_or_default("VARDIFF_UNCERTAINTY_FLOOR_WEIGHT", "0", 0.5f64),
+        0.0,
+        "zero is a legitimate override — it is the unfed arm — and must not be read as absent"
+    );
+}

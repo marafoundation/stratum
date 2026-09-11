@@ -26,3 +26,9 @@ hashbrown = { workspace = true, optional = true }
 [features]
 default = []
 no_std = ["hashbrown"]
+
+# Lets a DIAGNOSTIC build override the vardiff parameters an A/B arm or a deadband sweep needs to
+# vary, from `VARDIFF_*` environment variables, with the shipped constants as defaults. Off by
+# default and not enabled by any shipping profile: see `vardiff::classic::params` for why the
+# override path is compiled out rather than merely left unset.
+vardiff-tunable = []

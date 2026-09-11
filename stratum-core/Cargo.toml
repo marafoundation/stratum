@@ -36,4 +36,9 @@ with_buffer_pool = [
     "codec_sv2/with_buffer_pool"
 ]
 sv1 = ["sv1_api"]
+
+# Passthrough for channels_sv2's diagnostic override seam. Present so a deploy can enable it on
+# the umbrella crate it actually depends on; enabling it changes nothing until a `VARDIFF_*`
+# variable is set.
+vardiff-tunable = ["channels_sv2/vardiff-tunable"]
 translation = ["stratum_translation", "sv1"]
