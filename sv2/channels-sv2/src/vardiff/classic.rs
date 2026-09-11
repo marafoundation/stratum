@@ -908,10 +908,19 @@ impl VardiffState {
     /// Returns the new belief. Records the retarget's direction, so a run of same-direction moves
     /// accelerates and a reversal starts over.
     fn partial_retarget(&self, estimate: f32, current: f32, fire_run: u32) -> f32 {
-        let step_fraction = (STEP_FRACTION_BASE
-            + STEP_FRACTION_GROWTH * (fire_run.saturating_sub(1)) as f32)
-            .min(STEP_FRACTION_MAX);
-        current + step_fraction * (estimate - current)
+        current + Self::step_fraction(fire_run) * (estimate - current)
+    }
+
+    /// Fraction of the gap to the estimate that a retarget at this run length closes.
+    ///
+    /// Split out of [`VardiffState::partial_retarget`] so the fire log can report it. It is the
+    /// term that makes two fires with identical deviations move the belief by different amounts,
+    /// and it was not recoverable from any log line: the endpoints are logged, but the fraction is
+    /// only their ratio once the bounds below have not touched the move, which is exactly what the
+    /// same line now says.
+    fn step_fraction(fire_run: u32) -> f32 {
+        (STEP_FRACTION_BASE + STEP_FRACTION_GROWTH * (fire_run.saturating_sub(1)) as f32)
+            .min(STEP_FRACTION_MAX)
     }
 
     /// What the retarget run would become if this evaluation's move reaches the wire.
@@ -1147,12 +1156,31 @@ impl Vardiff for VardiffState {
             same_direction_run,
         );
 
+        // `shares` is appended, not inserted: the A/B harness scrapes this line twice, once for
+        // `Deviation D% against a threshold of T%` and once for `threshold of T% over Ws`, and both
+        // patterns are prefixes of what is emitted here. Adding a field after `over {}s` leaves
+        // every accumulated series matchable; putting one in the middle would not.
+        //
+        // Why the harness needs it on THIS line rather than reading it off the multi-line block
+        // above, which already reports `Shares since last update`. Both are per-evaluation, but the
+        // block is a separate log record, so pairing them means pairing by ORDER -- and the
+        // deviation series is what `sigma_hat` and the loosen-side margin are computed from, on a
+        // rig where a measured 32.9% of the candidate arm's evaluations and 39.3% of the control's
+        // are zero-share. Pooling those with mining evaluations moves `sigma_hat` from 16.74% to
+        // 127.12%, because a zero-share evaluation reports a deviation of exactly 100.00% by
+        // construction. The blockwise miner-absence gate removes the worst of it, but the absence
+        // episodes measured 1-5 hours against a 3.9-hour arm boundary, so they straddle it.
+        //
+        // The harness can approximate this today by dropping `deviation >= 99.99%`, and does. The
+        // field makes it exact, and makes it exact on the UNFED arm too -- the `ratio_std` rail that
+        // identifies a silent channel is only logged by a build carrying the C6b term.
         debug!(
             target: "vardiff",
-            "Deviation {:.2}% against a threshold of {:.2}% over {}s",
+            "Deviation {:.2}% against a threshold of {:.2}% over {}s, shares {}",
             hashrate_delta_percentage,
             threshold,
             delta_time,
+            pending_shares,
         );
 
         // The LIVE fingerprint for the C6b fix, and the reason it is two numbers rather than one.
@@ -1205,7 +1233,8 @@ impl Vardiff for VardiffState {
         // unbounded change of belief, however large the deviation it reports.
         let max_step_ratio = params::max_step_ratio();
         let bounded = new_hashrate.clamp(hashrate / max_step_ratio, hashrate * max_step_ratio);
-        if bounded != new_hashrate {
+        let step_bounded = bounded != new_hashrate;
+        if step_bounded {
             debug!(
                 target: "vardiff",
                 "Move bounded to {:.0}x per evaluation: {:.2} -> {:.2} H/s",
@@ -1221,9 +1250,11 @@ impl Vardiff for VardiffState {
         // it through, so the realized displacement depends on the step size, while a floor pins it
         // at `MAX_SILENT_DISPLACEMENT` for any estimator. Only downward movement is constrained,
         // and only while `evidenced_hashrate` is stale — any share re-anchors it above.
+        let mut ease_bounded = false;
         if pending_shares == 0 && self.evidenced_hashrate > 0.0 {
             let silent_floor = self.evidenced_hashrate / params::max_silent_displacement();
             if new_hashrate < silent_floor {
+                ease_bounded = true;
                 debug!(
                     target: "vardiff",
                     "Ease bounded at {:.0}x below the last evidenced belief: {:.2} -> {:.2} H/s",
@@ -1235,7 +1266,8 @@ impl Vardiff for VardiffState {
             }
         }
 
-        if new_hashrate < min_hashrate {
+        let min_clamped = new_hashrate < min_hashrate;
+        if min_clamped {
             debug!(
                 target: "vardiff",
                 "New hashrate {:.2} H/s below minimum threshold {:.2} H/s — clamping",
@@ -1260,6 +1292,44 @@ impl Vardiff for VardiffState {
         // Past every floor and clamp, so this move is going out. Only now does it count toward the
         // run that sizes the next step.
         self.commit_fire(tightening);
+
+        // WHY a fire needs its own line, when both endpoints are already logged above.
+        //
+        // Everything a fire is attributed to today is RECONSTRUCTED. The pre-registered loosen
+        // share (item 2) is computed by differencing the two hashrates on the `Calculated new
+        // hashrate` line, which recovers the direction but not why that direction won. And the
+        // simulated deadband sweep bottoms out at a residual ~0.02 fires/h that no width removes,
+        // with three named candidates -- the x8 tighten multiplier, the direction discount, and
+        // residual convergence after the 4-tau discard -- and no way to tell them apart on
+        // hardware, because the discount and the run length that earns it are not emitted anywhere.
+        //
+        // Every term that decided this fire, on one line: the direction, the evaluation run that
+        // set the discount, the retarget run that set the step, the step fraction itself, and which
+        // of the three post-decision bounds touched the value. `bounds` is positional -- `s` step,
+        // `e` ease, `m` minimum, `-` untouched -- so a fire that no bound modified reads `---` and
+        // the deviation-to-move arithmetic is checkable straight off the line.
+        //
+        // Naming, deliberately: no `threshold of N% over Ns` and no `Deviation N% against`, both of
+        // which the A/B harness scrapes. `thr` and `dev` instead. One line per fire, which on the
+        // candidate arm is 45 in 37 hours.
+        debug!(
+            target: "vardiff",
+            "Retarget committed: {:.2} -> {:.2} H/s, {}, eval_run {}, fire_run {}, \
+             step_fraction {:.2}, dev {:.2}%, thr {:.2}%, shares {}, bounds {}{}{}",
+            hashrate,
+            new_hashrate,
+            if tightening { "tighten" } else { "loosen" },
+            same_direction_run,
+            fire_run,
+            Self::step_fraction(fire_run),
+            hashrate_delta_percentage,
+            threshold,
+            pending_shares,
+            if step_bounded { 's' } else { '-' },
+            if ease_bounded { 'e' } else { '-' },
+            if min_clamped { 'm' } else { '-' },
+        );
+
         self.rescale_ewma(new_hashrate, hashrate);
         self.set_timestamp_of_last_update(now);
 

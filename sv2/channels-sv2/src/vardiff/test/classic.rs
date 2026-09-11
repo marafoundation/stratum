@@ -1252,3 +1252,54 @@ fn the_parameter_line_is_due_at_start_hourly_and_after_a_backwards_clock_step() 
          is suppressed for the length of the step"
     );
 }
+
+/// Each log line the A/B harness scrapes must be emitted from exactly one place.
+///
+/// The harness identifies its series by substring: `Hashrate update check triggered` counts
+/// evaluations, `threshold of N% over Ns` scrapes window lengths, `Deviation D% against a threshold
+/// of T%` supplies both halves of `a = threshold/sigma`. A second line matching any of those does
+/// not fail loudly — it inflates a count or a percentile, and every figure downstream stays
+/// plausible. The C6b line already carries a comment saying it avoids `threshold of N% over Ns` for
+/// that reason, and a comment is not a check: this is, and it runs on every `cargo test`.
+///
+/// Source-level rather than output-level so it needs no subscriber and no dev-dependency. Comment
+/// lines are excluded, because several of them quote these very patterns while explaining why they
+/// are reserved — including this test's own rationale.
+#[test]
+fn each_scraped_log_pattern_is_emitted_from_exactly_one_place() {
+    let src = include_str!("../classic.rs");
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for pattern in [
+        "vardiff parameters:",
+        "Hashrate update check triggered",
+        "Calculated new hashrate",
+        "Deviation {",
+        "against a threshold of",
+        "C6b floor:",
+        "Move bounded to",
+        "Ease bounded at",
+        "below minimum threshold",
+        "Retarget committed:",
+    ] {
+        let n = code.matches(pattern).count();
+        assert_eq!(
+            n, 1,
+            "the A/B harness keys a series on `{pattern}`; it is emitted from {n} places, so its \
+             tally is wrong by however often the other one fires"
+        );
+    }
+
+    // And the new lines must not collide with the two patterns that are scraped as prefixes of a
+    // longer line. Checked as a property of the file rather than of a list: exactly one line may
+    // contain `over {}s`, the window scrape's anchor.
+    let windows = code.matches("over {}s").count();
+    assert_eq!(
+        windows, 1,
+        "`threshold of T% over Ws` is the window scrape; {windows} lines carry `over {{}}s`"
+    );
+}
