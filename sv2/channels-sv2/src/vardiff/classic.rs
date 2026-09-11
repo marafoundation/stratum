@@ -24,6 +24,14 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 /// shares arrive, so a genuinely declining miner, which still submits, is never held back by it.
 pub(crate) const MAX_SILENT_DISPLACEMENT: f32 = 9.0;
 
+/// How often the parameter line is re-emitted, in seconds.
+///
+/// Not a tuning parameter — it trades log volume against how much history a rotated log can lose
+/// and still be attributable. An hour is two orders under the observed vardiff line rate (~455 an
+/// hour on the candidate arm) and two orders over the retention a `50m x 3` cap gives that arm, so
+/// no plausible rotation can leave a window with no fingerprint in it.
+pub(crate) const FINGERPRINT_REEMIT_SECS: u64 = 3600;
+
 /// Share rate below which the decision threshold is sized from a Poisson interval rather than a
 /// sequential test, in shares per minute.
 ///
@@ -516,7 +524,8 @@ impl VardiffState {
         )
     }
 
-    /// Emits [`VardiffState::parameter_fingerprint`] once per process.
+    /// Emits [`VardiffState::parameter_fingerprint`] at process start and at most once per
+    /// [`FINGERPRINT_REEMIT_SECS`] thereafter.
     ///
     /// Why this exists: two arms of an A/B test that differ only in a private constant are
     /// indistinguishable from outside. No exported symbol differs, and none of the
@@ -525,15 +534,60 @@ impl VardiffState {
     /// deployment record is the only arm identity, and a run attributed from logs alone cannot
     /// be attributed at all. This line makes the numbers the fingerprint.
     ///
+    /// ## Why once per process was not enough
+    ///
+    /// It fired from the constructor and nowhere else, so its evidence had a shelf life. Measured
+    /// on the rig: the candidate arm's container started `2026-09-08T19:22:35` and the earliest
+    /// line still in `docker logs` was `2026-09-09T10:27:41` — the fingerprint had **rotated out**,
+    /// and the A/B's identity check read MISMATCH on a correct build until it was taught to fall
+    /// back to grepping a symbol out of the binary. A once-per-process line is a claim about the
+    /// past that the log is under no obligation to keep.
+    ///
+    /// Re-emitting is also strictly more informative than repeating: it is evidence the running
+    /// process *still* holds these parameters at that timestamp, which a start-up line cannot be.
+    /// With the parameters overridable that matters more, because the values are no longer implied
+    /// by the build.
+    ///
+    /// ## Cost, and why the interval is an hour
+    ///
+    /// One line per hour per process, against the ~16,900 vardiff lines the candidate arm emitted
+    /// over 37 hours. Process-wide rather than per channel, through one atomic, because it
+    /// describes the build and the per-evaluation lines are already the per-channel record.
+    ///
     /// `info!` rather than `debug!` deliberately: which controller is running should not depend
-    /// on whether debug logging happened to be switched on. Once per process rather than once
-    /// per channel because it describes the build, not the channel — and because the
-    /// per-evaluation lines are already the per-channel record.
-    fn log_parameters_once() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            info!(target: "vardiff", "vardiff parameters: {}", Self::parameter_fingerprint());
-        });
+    /// on whether debug logging happened to be switched on.
+    ///
+    /// The compare-exchange, rather than a load and a store, is what stops concurrent channels
+    /// each emitting on the same due tick.
+    /// Whether the parameter line is due, given when it was last emitted.
+    ///
+    /// Split out from the emit so the schedule is testable without a subscriber and without the
+    /// process-wide atomic, which no test can arrange the state of: any other test that constructs
+    /// a `VardiffState` has already moved it.
+    ///
+    /// `now < last` counts as due. A backwards clock step would otherwise leave `last` in the
+    /// future and suppress the line for the length of the step — silently, and precisely when
+    /// knowing what the process is running is most useful.
+    pub(crate) fn fingerprint_due(last: u64, now: u64) -> bool {
+        last == 0 || now < last || now - last >= FINGERPRINT_REEMIT_SECS
+    }
+
+    fn log_parameters_if_due(now: u64) {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+
+        let last = LAST.load(Ordering::Relaxed);
+        if !Self::fingerprint_due(last, now) {
+            return;
+        }
+        // `max(1)` so a zero clock cannot be stored as the "never emitted" sentinel.
+        if LAST
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        info!(target: "vardiff", "vardiff parameters: {}", Self::parameter_fingerprint());
     }
 
     /// Creates a new `VardiffState` reading time from `clock`.
@@ -551,9 +605,12 @@ impl VardiffState {
         min_allowed_hashrate: f32,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, VardiffError> {
-        Self::log_parameters_once();
-
         let timestamp_secs = clock.now_secs()?;
+
+        // After the clock read, not before it: the emit is now rate-limited on that clock, so it
+        // needs a timestamp to record. A construction failure therefore emits nothing, which is
+        // right — a controller that did not come up has no parameters in force.
+        Self::log_parameters_if_due(timestamp_secs);
 
         let min_allowed_hashrate = if min_allowed_hashrate.is_finite() && min_allowed_hashrate > 0.0
         {
@@ -972,6 +1029,11 @@ impl Vardiff for VardiffState {
         shares_per_minute: f32,
     ) -> Result<Option<f32>, VardiffError> {
         let now = self.clock.now_secs()?;
+
+        // Ahead of every early return below, so the line keeps arriving on a channel that is
+        // silent, under its minimum interval, or in a backwards clock step. Those are exactly the
+        // states in which the arm's identity is least readable from anything else.
+        Self::log_parameters_if_due(now);
 
         let delta_time = match now.checked_sub(self.timestamp_of_last_update) {
             Some(delta_time) => delta_time,

@@ -1222,3 +1222,33 @@ fn an_unparsable_override_keeps_the_default() {
         "zero is a legitimate override — it is the unfed arm — and must not be read as absent"
     );
 }
+
+/// The parameter line's schedule: emit at start, once an hour after, and again if the clock moves
+/// backwards.
+///
+/// The failure this guards against is the one already observed on the rig — the fingerprint gone
+/// from `docker logs` while the arm was still running, leaving the identity check with nothing to
+/// read. The schedule is asserted rather than the emission because the emit is rate-limited through
+/// a process-wide atomic that no test can put into a known state.
+#[test]
+fn the_parameter_line_is_due_at_start_hourly_and_after_a_backwards_clock_step() {
+    use crate::vardiff::classic::FINGERPRINT_REEMIT_SECS;
+
+    assert!(
+        VardiffState::fingerprint_due(0, 1_000_000),
+        "never emitted must be due, whatever the clock says"
+    );
+    assert!(
+        !VardiffState::fingerprint_due(1_000_000, 1_000_000 + FINGERPRINT_REEMIT_SECS - 1),
+        "one second short of the interval must not re-emit, or the rate limit is not one"
+    );
+    assert!(VardiffState::fingerprint_due(
+        1_000_000,
+        1_000_000 + FINGERPRINT_REEMIT_SECS
+    ));
+    assert!(
+        VardiffState::fingerprint_due(1_000_000, 999_000),
+        "a backwards clock step must re-emit; otherwise `last` sits in the future and the line \
+         is suppressed for the length of the step"
+    );
+}
