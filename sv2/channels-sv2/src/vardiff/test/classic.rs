@@ -210,10 +210,8 @@ fn test_silent_channel_ease_displacement_is_bounded() {
         }
     }
 
-    // Displacement must settle at `3² = 9×`, the bound `MAX_CONSECUTIVE_SILENT_EASES = 2` sets.
-    // Written as a literal rather than derived from that constant deliberately: a derived
-    // expectation moves with the constant and would assert nothing, and this way the test also
-    // compiles and fails against a tree without the bound at all.
+    // `3² = 9×`, the bound `MAX_CONSECUTIVE_SILENT_EASES = 2` sets. Literal, not derived from the
+    // constant: a derived expectation moves with it and asserts nothing.
     let expected = TEST_INITIAL_HASHRATE / 9.0;
     assert!(
         (hashrate / expected - 1.0).abs() < 1e-3,
@@ -233,8 +231,7 @@ fn test_share_activity_clears_the_silence_budget() {
     let target =
         hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
 
-    // Spend the whole budget in silence, then submit, three times over. `2` is
-    // MAX_CONSECUTIVE_SILENT_EASES, as a literal so this also compiles against a tree without it.
+    // Spend the whole budget in silence, then submit, three times over.
     for _ in 0..3 {
         for _ in 0..2 {
             simulate_shares_and_wait(&mut vardiff, 0, 61);

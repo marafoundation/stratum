@@ -7,20 +7,10 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 
 /// How many consecutive zero-share eases the difficulty may take before it is held.
 ///
-/// Bounds *displacement* — the ratio of a channel's true hashrate to the believed one, `H_t/H_b`.
-/// The ease is multiplicative, so `n` of them leave the belief `3ⁿ` low, and displacement is a
-/// multiplier on the pool's own share-rate target: at `H_t/H_b = d` a miner asked for `r*`
-/// shares/min sends `r*·d`. At `2` the worst case is `d = 9`, whatever `r*` a deployment chooses;
-/// bounding a count rather than a rate-normalised budget is what makes it independent of `r*`, and
-/// it needs no division.
-///
-/// `9` also keeps a returning miner's correction at `800%`, under the `1000%` arm below that caps
-/// the climb back to `×3` per evaluation. So the channel re-targets in one evaluation instead of
-/// walking up in steps; `d > 11` is where that cap engages.
-///
-/// The floor, `min_allowed_hashrate`, does not stop the descent: from a 200 TH belief its `1.0` H/s
-/// default is ~30 eases away. Production incidents, the probability argument for `2`, and the
-/// rejected alternatives are in the commit that introduced this constant.
+/// Each ease is multiplicative, so `n` of them leave the believed hashrate `3ⁿ` low; at `2` a
+/// returning miner is served at most `9×` too little difficulty. `min_allowed_hashrate` does not
+/// bound this — from a 200 TH belief its default floor is ~30 eases away. Derivation and the
+/// choice of `2` are in the introducing commit.
 const MAX_CONSECUTIVE_SILENT_EASES: u8 = 2;
 
 use super::{error::VardiffError, Vardiff};
@@ -265,8 +255,7 @@ impl Vardiff for VardiffState {
         // realized_share_per_min is 0.0 when d.difficulty_mgmt.shares_since_last_update is 0
         // so it's safe to compare realized_share_per_min with == 0.0
         if realized_share_per_min == 0.0 {
-            // Bounded by the hold above, which returns before this arm once the budget is spent,
-            // so this cannot exceed `MAX_CONSECUTIVE_SILENT_EASES`.
+            // Cannot exceed the bound: the hold above returns once the budget is spent.
             self.silent_eases += 1;
             new_hashrate = match delta_time {
                 dt if dt <= 30 => hashrate / 1.5,
