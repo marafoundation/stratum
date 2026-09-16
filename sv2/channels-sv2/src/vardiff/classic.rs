@@ -184,6 +184,24 @@ const MAX_STEP_RATIO: f32 = 2.0;
 ///
 /// Old evidence decays on the clock at `e^(−Δt/tau)`, which is what makes the window unable to
 /// entrench: it forgets whether or not the controller ever decides to act.
+/// Longest window the dense threshold is allowed to be measured over, in seconds.
+///
+/// The dense branch carries an evidence term `EVIDENCE_AT_ONE_MINUTE / window_minutes`, and the
+/// window runs from the last retarget -- so on a channel that submits shares but never fires it grows
+/// without bound and that term decays to nothing, leaving the bare `MIN_THRESHOLD_FRACTION`. Bounding
+/// the window bounds the term from below, which bounds the threshold from below.
+///
+/// Derived rather than chosen, and a trade rather than a free win. The deviation is an AR(1) in log
+/// belief, so distinct up-crossings of a bar `b` go as `exp(-b^2 / 2*sigma^2)` with
+/// `sigma = sqrt(30 / (r * tau))`. At 6.45 shares a minute, `tau = 1200 s` and this cap, the evidence
+/// term cannot fall below 4.64 pp, which lifts the asymptotic bar from 5.00 pp to 9.64 pp and cuts the
+/// long-window rate of unnecessary retargets by about 2.4x.
+///
+/// The same lift is the cost. The term is a term *in the threshold*, so holding it up delays every
+/// retarget the threshold gates, including the wanted ones: a real decline on a long-quiet channel
+/// must clear more before it is acted on.
+const WINDOW_CAP_SECS: u64 = 900;
+
 const EWMA_TAU_SECS: u64 = 360;
 
 use super::{
@@ -752,6 +770,20 @@ impl Vardiff for VardiffState {
         );
 
         if (hashrate_delta_percentage as f64) < threshold {
+            // Re-anchor the window once it reaches the cap, so the averaging window cannot grow with
+            // channel age. Only the anchor moves: the belief is preserved, because nothing about the
+            // miner changed and no difficulty was set -- `reset_counter` would discard the EWMA, which
+            // is the backwards-clock "start over" path and the wrong tool here.
+            //
+            // Not applied below the sparse seam. There the threshold is a statistic of the window's
+            // own count, `(POISSON_Z * sqrt(lambda) + 0.5) / lambda` with
+            // `lambda = shares_per_minute * window / 60`, so bounding the window bounds the threshold
+            // from BELOW at a rate where it needs to keep falling -- and a declining channel is left
+            // stranded above a bar that has stopped coming down to meet it. Measured on the research
+            // branch at +29.9% settled over-difficulty before the seam gate was added.
+            if shares_per_minute >= SPARSE_SPM_SEAM && delta_time >= WINDOW_CAP_SECS {
+                self.set_timestamp_of_last_update(now);
+            }
             return Ok(None);
         }
 

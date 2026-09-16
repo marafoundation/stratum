@@ -5,6 +5,7 @@ use std::{thread, time::Duration};
 mod classic;
 mod regimes;
 mod trajectory;
+mod window_cap;
 
 use super::Vardiff;
 use crate::target::hash_rate_to_target;

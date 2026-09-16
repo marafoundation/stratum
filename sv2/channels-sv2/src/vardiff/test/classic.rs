@@ -402,13 +402,17 @@ fn test_decline_detected_regardless_of_window_age() {
     }
 
     assert!(
-        evaluations_to_react <= 2,
+        evaluations_to_react <= 3,
         "an hour-old window must not delay detection; took {evaluations_to_react} evaluations \
          (the fixed ladder over a cumulative window took 13)"
     );
+    // Two, not one, since the window cap landed. The cap holds the threshold's evidence term up on a
+    // long-quiet channel, and a held threshold delays every retarget it gates including this one --
+    // which is the cost side of the cap's trade, stated where it is paid. It buys 2.5x to 5x fewer
+    // unnecessary retargets on a stable channel; see `super::window_cap` and `WINDOW_CAP_SECS`.
     assert_eq!(
-        evaluations_to_react, 1,
-        "reaction time is 1 evaluation; a change here is a change in reaction time"
+        evaluations_to_react, 2,
+        "reaction time is 2 evaluations; a change here is a change in reaction time"
     );
 }
 
