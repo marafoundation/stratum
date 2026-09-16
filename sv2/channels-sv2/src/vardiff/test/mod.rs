@@ -4,6 +4,7 @@ use std::{thread, time::Duration};
 
 mod classic;
 mod regimes;
+mod target_rate;
 mod trajectory;
 mod window_cap;
 

@@ -674,6 +674,32 @@ impl Vardiff for VardiffState {
             return Ok(None);
         }
 
+        // `shares_per_minute` is the operator's target rate and arrives unvalidated: it comes from
+        // configuration, and the two callers in `sv2-apps` pass it straight through. Every use of it
+        // below assumes it is a positive, finite number, and one of them is a divisor.
+        //
+        // The reachable failure is a NaN belief, and it escapes rather than being caught. If
+        // `hash_rate_from_target` errors, [`VardiffState::estimate`] falls back to
+        // `hashrate * realized / shares_per_minute`; at `shares_per_minute == 0.0` with nothing
+        // realized that is `0.0 / 0.0`. The deviation computed from a NaN estimate is also NaN, and
+        // `NaN < threshold` is **false**, so the "deviation too small to act on" return is skipped
+        // and the NaN travels on. `f32::clamp` propagates NaN rather than clamping it, `NaN <
+        // min_hashrate` is false, and `NaN == hashrate` is false — so all three guards below pass it
+        // through and the caller is handed NaN as a hashrate to set a difficulty from.
+        //
+        // Declining to act is the only safe answer: a target rate of zero or a non-finite one has no
+        // difficulty that satisfies it, so there is nothing to converge to. Checked here rather than
+        // at the fallback because the fallback is not the only place the assumption is made, and a
+        // guard at the entry cannot be bypassed by a later edit that adds another use.
+        if !shares_per_minute.is_finite() || shares_per_minute <= 0.0 {
+            debug!(
+                target: "vardiff",
+                "shares_per_minute {shares_per_minute} is not a positive finite rate; \
+                 no difficulty satisfies it, so this evaluation is skipped",
+            );
+            return Ok(None);
+        }
+
         // `min_allowed_hashrate` is validated in `new_with_min`, but the field is `pub`,
         // so direct assignment can still plant a non-finite or non-positive floor;
         // sanitize it here as well before relying on it.
