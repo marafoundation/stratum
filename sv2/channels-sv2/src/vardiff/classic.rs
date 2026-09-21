@@ -20,8 +20,28 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 /// `min_allowed_hashrate` is no substitute: from a 200 TH belief its `1.0` H/s default is some
 /// thirty eases away.
 ///
-/// Binds only while evidence is absent: [`VardiffState::evidenced_hashrate`] re-anchors whenever
-/// shares arrive, so a genuinely declining miner, which still submits, is never held back by it.
+/// Re-anchors on evidence: [`VardiffState::evidenced_hashrate`] moves whenever an evaluation sees a
+/// share, so a declining miner that still submits *at a rate the controller evaluates against* is not
+/// held back by it.
+///
+/// **That qualification is load-bearing, and without it the sentence is false.** "Whenever shares
+/// arrive" is a weak guarantee when arrivals are rare compared with the evaluation cadence, and the
+/// case where it fails is a channel opened at a difficulty far too hard: it delivers `r*/d` for a
+/// declaration wrong by `d`, so at `d = 100` and 2 shares a minute that is one share per fifty minutes,
+/// almost every evaluation sees none, and the anchor stays at the *opening* belief -- a number no
+/// evidence ever supported. The ease then floors at one ninth of it and stops.
+///
+/// Measured: such a channel rests at `9x` below its declared nominal, which is still `11x` above the
+/// truth, and stays there for at least 48 hours with no further retargets. Raising this constant to
+/// `90` lets the same channel converge, which is what identifies this bound as the cause rather than
+/// the threshold or the step schedule. The same over-declaration at 12 shares a minute recovers, because
+/// there a mis-set channel still delivers often enough to re-anchor. See `test/cold_start.rs`.
+///
+/// So the bound is a bounded-regret policy in both directions, not only against a returning miner's
+/// share flood: it also bounds how far an over-declaration can be corrected, and at sparse rates that
+/// second cost is unbounded in duration. Not repaired here -- the fix is a choice between anchoring on
+/// something other than an unverified opening belief, distinguishing silence from over-difficulty, and
+/// admitting fewer sparse channels -- but it is no longer undocumented.
 const MAX_SILENT_DISPLACEMENT: f32 = 9.0;
 
 /// Share rate below which the decision threshold is sized from a Poisson interval rather than a

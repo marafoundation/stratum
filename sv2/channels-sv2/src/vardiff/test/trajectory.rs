@@ -217,6 +217,13 @@ pub(super) struct Trial {
     pub(super) shares_fed: u64,
     /// Where difficulty ended up.
     pub(super) final_hashrate: f32,
+    /// Ticks from the start of the measured span until the belief is first within 10% of the truth, or
+    /// `None` if it never gets there.
+    ///
+    /// Only meaningful on a trajectory that starts wrong, which until now none of them did. Ten percent
+    /// because it is inside every threshold the controller applies, so reaching it means the controller
+    /// has stopped being the thing in the way.
+    pub(super) ticks_to_converge: Option<usize>,
     /// The decision threshold in force at the last evaluation, in percent, read from the controller
     /// rather than recomputed.
     ///
@@ -286,6 +293,8 @@ pub(super) fn run_trial(
     let mut worst_over_pct = f64::MIN;
     let mut final_error_pct = 0.0;
     let mut final_threshold_pct = f64::NAN;
+    let mut ticks_to_converge = None;
+    let mut measured_ticks = 0usize;
 
     while elapsed < warm_up_secs + measured_secs {
         elapsed += TICK_SECS;
@@ -313,6 +322,10 @@ pub(super) fn run_trial(
         // above were produced against.
         let error_pct = (believed as f64 / delivered_now).ln() * 100.0;
         if measuring {
+            measured_ticks += 1;
+            if ticks_to_converge.is_none() && error_pct.abs() < 10.0 {
+                ticks_to_converge = Some(measured_ticks);
+            }
             shares_fed += shares as u64;
             errors.push(error_pct.abs());
             worst_over_pct = worst_over_pct.max(error_pct);
@@ -342,6 +355,7 @@ pub(super) fn run_trial(
         retargets,
         shares_fed,
         final_hashrate: believed,
+        ticks_to_converge,
         final_threshold_pct,
     }
 }
@@ -419,6 +433,13 @@ pub(super) fn measure_arm_wander(
         retargets: pick(runs.iter().map(|r| r.retargets as f64).collect()) as usize,
         shares_fed: pick(runs.iter().map(|r| r.shares_fed as f64).collect()) as u64,
         final_hashrate: pick(runs.iter().map(|r| r.final_hashrate as f64).collect()) as f32,
+        // A trial that never converged counts as the whole span rather than being dropped, so a median
+        // over mostly-unconverged trials reads as slow rather than as fast-on-a-subset.
+        ticks_to_converge: Some(pick(
+            runs.iter()
+                .map(|r| r.ticks_to_converge.map_or(f64::MAX, |t| t as f64))
+                .collect(),
+        ) as usize),
         final_threshold_pct: pick(runs.iter().map(|r| r.final_threshold_pct).collect()),
     }
 }
@@ -426,6 +447,17 @@ pub(super) fn measure_arm_wander(
 /// A miner that never changes.
 pub(super) fn constant() -> impl Fn(u64) -> f64 {
     |_elapsed| START_HASHRATE as f64
+}
+
+/// A miner delivering `factor` times what its declared nominal said, from the first tick.
+///
+/// Cold start, which nothing else here measures. The harness opens every channel believing
+/// [`START_HASHRATE`], so a miner delivering `factor` times that is exactly a channel whose declared
+/// `nominal_hash_rate` was wrong by `factor` -- the case `MIN_EVALUATION_INTERVAL_SECS` exists to rate
+/// limit and the only one that exercises [`MAX_STEP_RATIO`]'s tightening arm, which the easing arm's
+/// analysis leaves untouched.
+pub(super) fn mis_declared(factor: f64) -> impl Fn(u64) -> f64 {
+    move |_elapsed| START_HASHRATE as f64 * factor
 }
 
 /// A miner losing `rate_pct_per_hr` of its hashrate each hour, floored at `total_drop`.

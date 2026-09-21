@@ -3,6 +3,7 @@
 use std::{thread, time::Duration};
 
 mod classic;
+mod cold_start;
 mod regimes;
 mod relations;
 mod sparse_parity;
