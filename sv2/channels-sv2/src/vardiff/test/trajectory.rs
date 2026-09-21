@@ -217,6 +217,15 @@ pub(super) struct Trial {
     pub(super) shares_fed: u64,
     /// Where difficulty ended up.
     pub(super) final_hashrate: f32,
+    /// Measured ticks on which the miner delivered anything at all.
+    ///
+    /// **The three error readings above are meaningless when this is zero**, and are reported as `0.0`
+    /// rather than left as the infinity that `ln(belief / 0)` produces. Tracking error is undefined while
+    /// a miner is absent -- no difficulty is correct for a hashrate of zero -- so a dark tick is skipped
+    /// rather than scored. A trajectory with dark ticks therefore reports its error over the ticks the
+    /// miner was present for, which is the quantity that means something: how wrong the difficulty is
+    /// when there is someone to serve it to.
+    pub(super) live_ticks: usize,
     /// Ticks from the start of the measured span until the belief is first within 10% of the truth, or
     /// `None` if it never gets there.
     ///
@@ -295,6 +304,7 @@ pub(super) fn run_trial(
     let mut final_threshold_pct = f64::NAN;
     let mut ticks_to_converge = None;
     let mut measured_ticks = 0usize;
+    let mut live_ticks = 0usize;
 
     while elapsed < warm_up_secs + measured_secs {
         elapsed += TICK_SECS;
@@ -318,15 +328,20 @@ pub(super) fn run_trial(
         }
 
         let measuring = elapsed > warm_up_secs;
-        // Read against the belief that was in force for this interval, which is the one the shares
-        // above were produced against.
-        let error_pct = (believed as f64 / delivered_now).ln() * 100.0;
         if measuring {
             measured_ticks += 1;
+            shares_fed += shares as u64;
+        }
+        // Read against the belief that was in force for this interval, which is the one the shares above
+        // were produced against. Skipped entirely while the miner is absent: no difficulty is correct for a
+        // hashrate of zero, so the ratio is undefined rather than infinite, and scoring it would let one
+        // dark tick swamp every real reading in the run.
+        if measuring && delivered_now > 0.0 {
+            let error_pct = (believed as f64 / delivered_now).ln() * 100.0;
+            live_ticks += 1;
             if ticks_to_converge.is_none() && error_pct.abs() < 10.0 {
                 ticks_to_converge = Some(measured_ticks);
             }
-            shares_fed += shares as u64;
             errors.push(error_pct.abs());
             worst_over_pct = worst_over_pct.max(error_pct);
             final_error_pct = error_pct;
@@ -347,14 +362,23 @@ pub(super) fn run_trial(
     }
 
     errors.sort_by(|a, b| a.partial_cmp(b).expect("no NaN readings"));
+    // A span the miner was absent for the whole of has no tracking error to report. Zero rather than a
+    // panic, flagged by `live_ticks`, because a trajectory may legitimately be dark throughout -- and NaN
+    // would trip the no-NaN guard in `median` for every caller.
+    let (median_error_pct, p95_error_pct) = if errors.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (errors[errors.len() / 2], errors[errors.len() * 95 / 100])
+    };
     Trial {
-        median_error_pct: errors[errors.len() / 2],
-        p95_error_pct: errors[errors.len() * 95 / 100],
+        median_error_pct,
+        p95_error_pct,
         final_error_pct,
-        worst_over_pct,
+        worst_over_pct: if live_ticks == 0 { 0.0 } else { worst_over_pct },
         retargets,
         shares_fed,
         final_hashrate: believed,
+        live_ticks,
         ticks_to_converge,
         final_threshold_pct,
     }
@@ -435,6 +459,7 @@ pub(super) fn measure_arm_wander(
         final_hashrate: pick(runs.iter().map(|r| r.final_hashrate as f64).collect()) as f32,
         // A trial that never converged counts as the whole span rather than being dropped, so a median
         // over mostly-unconverged trials reads as slow rather than as fast-on-a-subset.
+        live_ticks: pick(runs.iter().map(|r| r.live_ticks as f64).collect()) as usize,
         ticks_to_converge: Some(pick(
             runs.iter()
                 .map(|r| r.ticks_to_converge.map_or(f64::MAX, |t| t as f64))
@@ -472,6 +497,24 @@ pub(super) fn declining(rate_pct_per_hr: f64, total_drop: f64) -> impl Fn(u64) -
 pub(super) fn goes_silent(silent_after_secs: u64) -> impl Fn(u64) -> f64 {
     move |elapsed| {
         if elapsed > silent_after_secs {
+            0.0
+        } else {
+            START_HASHRATE as f64
+        }
+    }
+}
+
+/// A miner that drops out entirely for `down_secs` of every `period_secs`, and delivers in full the rest
+/// of the time.
+///
+/// Repeated outage, as distinct from [`goes_silent`]'s single one. The distinction matters because the
+/// silence machinery is *stateful*: an outage eases the belief toward the displacement floor and a return
+/// has to tighten it back, so a channel that flaps drives that pair of mechanisms against each other
+/// rather than exercising either once. It is also the disturbance that most resembles the cold-start lock
+/// -- silence-detection interacting with a belief that is already wrong -- driven harder.
+pub(super) fn intermittent(period_secs: u64, down_secs: u64) -> impl Fn(u64) -> f64 {
+    move |elapsed| {
+        if elapsed % period_secs < down_secs {
             0.0
         } else {
             START_HASHRATE as f64

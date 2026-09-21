@@ -4,6 +4,7 @@ use std::{thread, time::Duration};
 
 mod classic;
 mod cold_start;
+mod outage;
 mod regimes;
 mod relations;
 mod sparse_parity;
