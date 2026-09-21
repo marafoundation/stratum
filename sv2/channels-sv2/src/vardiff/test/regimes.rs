@@ -212,3 +212,89 @@ fn a_miner_swinging_near_the_memory_is_averaged_rather_than_followed() {
          the band -- {report}"
     );
 }
+
+/// **What the absolute settled criterion reads on the shipped controller.**
+///
+/// The criteria above are *relative* — a final error below half of what never
+/// adjusting would have given. That scales with the disturbance, and on the
+/// deepest cell here it permits **34.7%** settled over-difficulty, where the
+/// criterion this controller's window and sensitivity were *selected* by is an
+/// absolute **5%** (`DECLINE_SAFETY_GATE_PCT`, which lives on the simulation
+/// branch and has no assertion here). So the selection criterion and the
+/// regression criterion diverged, by up to 6.9x on these cells, and nothing on
+/// this branch would notice the shipped configuration drifting between them.
+///
+/// This measures the absolute reading and holds it, so that drift is caught. It
+/// is deliberately not phrased as the 5% gate: the number asserted is what the
+/// controller actually achieves, so the test fails on a *regression* rather than
+/// encoding a target it may or may not clear.
+#[test]
+fn the_absolute_settled_error_is_held_not_merely_the_relative_one() {
+    /// Cells shared with `a_decline_is_detected_at_every_share_rate`.
+    const CELLS: [(f64, f64); 4] = [(5.0, 0.20), (2.0, 0.08), (10.0, 0.40), (40.0, 0.50)];
+    const TRIALS: usize = 40;
+    /// The worst absolute settled over-difficulty this controller is allowed to
+    /// show across the grid. Set from measurement with headroom, not from the
+    /// selection gate — see the doc comment.
+    /// The worst absolute settled over-difficulty this controller may show across
+    /// the grid. Set from measurement with headroom — **measured +5.64% on the
+    /// sparse deep-decline cell, which already exceeds the 5% selection gate by
+    /// 13%.** Asserting 5.0 here would encode a target this controller does not
+    /// meet; asserting the measured value holds the line against regression while
+    /// the doc comment records the gap. See `C10_EVALUATION_2026_09_21.md` §13.
+    const MAX_ABSOLUTE_SETTLED_PCT: f64 = 7.0;
+    /// And the *under*-difficulty side, which no criterion on either branch bounds.
+    /// Measured worst −11.10%; held so that over-correction is a regression too.
+    const MIN_ABSOLUTE_SETTLED_PCT: f64 = -15.0;
+    /// Mirrors `MAX_REMAINING` in `a_decline_is_detected_at_every_share_rate`,
+    /// which is local to that test. Used only to report what the relative
+    /// criterion would have allowed, never to assert.
+    const RELATIVE_PERMITTED: f64 = 0.5;
+
+    let mut worst = (f64::MIN, String::new());
+    for (rate_pct_per_hr, drop) in CELLS {
+        for spm in [2.0f32, 12.0] {
+            let trial = measure(
+                &declining(rate_pct_per_hr, drop),
+                spm,
+                ONE_HOUR,
+                3 * ONE_HOUR,
+                TRIALS,
+            );
+            let reference = never_adjusted_pct(drop);
+            let label = format!(
+                "{rate_pct_per_hr} %/hr losing {:.0}% at {spm} spm: settled {:+.2}%, \
+                 relative criterion permitted {:+.2}%",
+                drop * 100.0,
+                trial.final_error_pct,
+                reference * RELATIVE_PERMITTED
+            );
+            if trial.final_error_pct > worst.0 {
+                worst = (trial.final_error_pct, label.clone());
+            }
+            assert!(
+                trial.final_error_pct >= MIN_ABSOLUTE_SETTLED_PCT,
+                "settled *under*-difficulty regressed past \
+                 {MIN_ABSOLUTE_SETTLED_PCT:.1}% -- {label}. Over-correcting downward costs the \
+                 miner nothing in payout under difficulty-weighted accounting but multiplies its \
+                 submission load, and no criterion on either branch bounds it."
+            );
+            assert!(
+                trial.final_error_pct <= MAX_ABSOLUTE_SETTLED_PCT,
+                "absolute settled over-difficulty regressed past \
+                 {MAX_ABSOLUTE_SETTLED_PCT:.1}% -- {label}. The relative criterion above would \
+                 still pass here, which is the point of this test: it is the only thing on this \
+                 branch that would catch the shipped configuration drifting away from the \
+                 criterion it was selected by."
+            );
+        }
+    }
+    assert!(
+        worst.0 > f64::MIN,
+        "no cell produced a reading -- the harness measured nothing"
+    );
+    eprintln!(
+        "  [absolute settled] worst across the grid: {:+.2}%  ({})",
+        worst.0, worst.1
+    );
+}
