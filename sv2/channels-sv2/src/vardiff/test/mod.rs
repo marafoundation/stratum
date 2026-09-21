@@ -4,6 +4,7 @@ use std::{thread, time::Duration};
 
 mod classic;
 mod regimes;
+mod relations;
 mod sparse_parity;
 mod target_rate;
 mod trajectory;

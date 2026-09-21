@@ -30,7 +30,7 @@ const MAX_SILENT_DISPLACEMENT: f32 = 9.0;
 /// Below this the per-window share count is small enough that its own sampling spread dominates,
 /// so the threshold has to be widened by that spread or the controller chases counting noise. At
 /// or above it there are enough shares per window for a sequential test to be the tighter choice.
-const SPARSE_SPM_SEAM: f32 = 6.0;
+pub(crate) const SPARSE_SPM_SEAM: f32 = 6.0;
 
 /// Two-sided 99% normal quantile, used to widen the sparse-branch threshold by the sampling
 /// spread of the observed share count.
@@ -53,7 +53,7 @@ const POISSON_Z: f64 = 2.576;
 /// hardware, comfortably inside the band, and it is load-bearing rather than an error — it parks
 /// the excursion band below the level at which a switch-miner leaves. Widening this constant or
 /// narrowing the multiplier moves the dead zone and therefore moves the offset.
-const MIN_THRESHOLD_FRACTION: f64 = 0.05;
+pub(crate) const MIN_THRESHOLD_FRACTION: f64 = 0.05;
 
 /// Deviation required after one minute of observation, as a fraction, on the dense branch.
 ///
@@ -64,7 +64,7 @@ const MIN_THRESHOLD_FRACTION: f64 = 0.05;
 /// after the cumulative-sum control chart, but nothing here accumulates anything — the value is a
 /// fixed requirement divided by elapsed time. Importing the name would have promised a sequential
 /// test the code does not perform.
-const EVIDENCE_AT_ONE_MINUTE: f64 = 1.5;
+pub(crate) const EVIDENCE_AT_ONE_MINUTE: f64 = 1.5;
 
 /// Share rate at which [`EVIDENCE_AT_ONE_MINUTE`] is calibrated, in shares per minute.
 ///
@@ -73,7 +73,7 @@ const EVIDENCE_AT_ONE_MINUTE: f64 = 1.5;
 /// resolving power. The requirement is scaled by `sqrt(k)` to match, which keeps the false-fire
 /// rate roughly flat across deployments rather than letting a high-rate channel retarget on noise
 /// a low-rate one would ignore.
-const REFERENCE_SPM: f64 = 30.0;
+pub(crate) const REFERENCE_SPM: f64 = 30.0;
 
 /// Extra evidence required before *tightening*, as a multiple of the loosening requirement.
 ///
@@ -88,7 +88,7 @@ const REFERENCE_SPM: f64 = 30.0;
 /// regardless of difficulty, was farmed: Bitcoin Cash's Emergency Difficulty Adjustment shipped in
 /// August 2017 and was replaced within months. The mechanism is not safe in general; it is safe
 /// under this accounting.
-const TIGHTEN_MULTIPLIER: f64 = 8.0;
+pub(crate) const TIGHTEN_MULTIPLIER: f64 = 8.0;
 
 /// How much the threshold relaxes per extra observation pointing the same way, as a fraction.
 ///
@@ -110,6 +110,33 @@ pub(crate) const MAX_DIRECTION_DISCOUNT: f64 = 0.6;
 /// keep state whose value is never read.
 const DIRECTION_RUN_AT_MAX_DISCOUNT: u32 =
     1 + (MAX_DIRECTION_DISCOUNT / DIRECTION_DISCOUNT_PER_OBSERVATION) as u32;
+
+/// Least extra evidence tightening ever requires, as a multiple of the loosening requirement.
+///
+/// [`TIGHTEN_MULTIPLIER`] is the burden of proof at a fresh run, and the discount erodes it, because
+/// the discount scales the whole threshold and applies to both directions. So the multiplier the
+/// controller actually enforces is a *range*, of which this is the floor, and it is the number that
+/// governs: an asymmetry that survives only at run 1 is not an asymmetry.
+///
+/// Derived, because it is the product of two constants chosen separately and it is not obvious from
+/// either. The assertion below is the part worth having. The two can be tuned into an *inversion* --
+/// at a discount ceiling above `1 - 1/TIGHTEN_MULTIPLIER`, currently `0.875`, a sustained run makes
+/// tightening require *less* evidence than loosening, which reverses the safety property the
+/// multiplier exists for rather than merely weakening it. Nothing else in the file would notice, so
+/// the relation is enforced here at compile time.
+// Read by the relation test and by the assertion below, neither of which rustc counts as a use.
+#[allow(dead_code)]
+pub(crate) const MIN_EFFECTIVE_TIGHTEN_MULTIPLIER: f64 =
+    TIGHTEN_MULTIPLIER * (1.0 - MAX_DIRECTION_DISCOUNT);
+// `assertions_on_constants`: folding to `true` is exactly what is wanted here — the assertion is a
+// compile-time check on a relation between constants, and it fires by failing to compile.
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(
+    MIN_EFFECTIVE_TIGHTEN_MULTIPLIER > 1.0,
+    "the same-direction discount has eroded the tighten asymmetry past parity: at this discount \
+     ceiling a sustained run makes tightening cheaper than loosening, inverting the property \
+     TIGHTEN_MULTIPLIER exists for"
+);
 
 /// Fraction of the gap to the new estimate that a first retarget closes.
 ///
@@ -178,7 +205,32 @@ const RUN_AT_MAX_STEP_FRACTION: u32 =
 /// size cannot, because each step is individually warranted by the evidence in front of it.
 /// Recognising that raising the difficulty is not reducing the share rate is a separate mechanism,
 /// and is not attempted here.
-const MAX_STEP_RATIO: f32 = 2.0;
+///
+/// **Its two arms are not equally alive, and that follows from the step fraction.** A retarget moves
+/// `f` of the gap, so it lands at `h·(1 + f·(estimate/h − 1))`. Downward that cannot reach `h/ratio`
+/// unless `f > 1/ratio`, whatever the estimate — at `f = 0.2` even an estimate of *zero* only reaches
+/// `0.8·h`. So the easing arm is unreachable until a same-direction retarget run has grown `f` past
+/// `1/MAX_STEP_RATIO`, and then it additionally needs the estimate to collapse by roughly `6×`. The
+/// tightening arm has no such gate: it binds whenever the estimate exceeds `h·(1 + (ratio−1)/f)`,
+/// which at `f = 0.2` is `6·h` and at `f = 0.6` is `2.67·h`.
+pub(crate) const MAX_STEP_RATIO: f32 = 2.0;
+
+/// Step fraction at which [`MAX_STEP_RATIO`]'s easing arm starts to be reachable at all.
+///
+/// Derived rather than written down, so it tracks the bound instead of restating it. The relation is
+/// worth enforcing rather than only documenting: at `STEP_FRACTION_MAX <= 1/MAX_STEP_RATIO` the easing
+/// arm is dead code at *every* run length, and a reader would have no way to tell from either constant.
+/// It is live here by `0.1` of step fraction — reached at a retarget run of 8 against a clamp of 9 —
+/// so the margin is thin, and shrinking `STEP_FRACTION_MAX` or raising `MAX_STEP_RATIO` closes it.
+// As above: read by the relation test and by the assertion, neither of which counts as a use.
+#[allow(dead_code)]
+pub(crate) const STEP_FRACTION_ENGAGING_THE_EASING_BOUND: f32 = 1.0 / MAX_STEP_RATIO;
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(
+    STEP_FRACTION_MAX > STEP_FRACTION_ENGAGING_THE_EASING_BOUND,
+    "MAX_STEP_RATIO's easing arm is unreachable at every step fraction the accelerating retarget can \
+     produce, so it is dead code: a partial step of f cannot divide the belief by more than 1/(1-f)"
+);
 
 /// Longest window the dense threshold is allowed to be measured over, in seconds.
 ///
@@ -207,7 +259,18 @@ const MAX_STEP_RATIO: f32 = 2.0;
 /// question. The earlier claim that it was derived cited `tau = 1200 s`, a candidate this branch does
 /// not ship; at `tau = 360` the same AR(1) up-crossing estimate gives about 1.3x rather than the 2.4x
 /// quoted, so the measurement above is what the cap rests on.
-const WINDOW_CAP_SECS: u64 = 900;
+pub(crate) const WINDOW_CAP_SECS: u64 = 900;
+
+/// Shortest window an evaluation will act on, in seconds.
+///
+/// Was an unnamed `15` inline. Named rather than derived, because it is not the threshold's job done
+/// twice: [`Self::dense_threshold`] deliberately does not clamp its window at one minute, so a short
+/// window already yields a proportionally higher bar and the bar alone refuses ordinary noise measured
+/// over a moment. What the bar cannot refuse is a *large* deviation measured over a moment — a channel
+/// whose declared nominal is a hundredfold out reports thousands of percent on its first evaluation and
+/// clears any bar — so this is a rate limiter on the retarget loop rather than a second noise gate, and
+/// what it bounds is how often [`MAX_STEP_RATIO`] may be spent.
+const MIN_EVALUATION_INTERVAL_SECS: u64 = 15;
 
 /// Time constant of the EWMA estimator, in seconds.
 ///
@@ -220,7 +283,7 @@ const WINDOW_CAP_SECS: u64 = 900;
 /// controls. Buying precision with `tau` costs agility, which is why this is a balance and not a
 /// maximum: 360 is the shortest window that stays safe on a sustained decline at the 2-4 share
 /// rates, and those rates are what select it. A channel above the seam would prefer a longer one.
-const EWMA_TAU_SECS: u64 = 360;
+pub(crate) const EWMA_TAU_SECS: u64 = 360;
 
 use super::{
     clock::{Clock, SystemClock},
@@ -736,8 +799,8 @@ impl Vardiff for VardiffState {
             None => {
                 // The clock stepped backwards (e.g. NTP correction), leaving the recorded
                 // timestamp in the future, so elapsed time is unmeasurable. Re-anchor the
-                // window to `now` and skip just this round: the `delta_time <= 15` guard
-                // below returns before `reset_counter()` runs, so without re-anchoring here
+                // window to `now` and skip just this round: the `MIN_EVALUATION_INTERVAL_SECS`
+                // guard below returns before `reset_counter()` runs, so without re-anchoring here
                 // every later round would measure against the same stale future timestamp
                 // and vardiff would stall for the whole length of the backwards step.
                 debug!(
@@ -751,7 +814,7 @@ impl Vardiff for VardiffState {
             }
         };
 
-        if delta_time <= 15 {
+        if delta_time <= MIN_EVALUATION_INTERVAL_SECS {
             return Ok(None);
         }
 
