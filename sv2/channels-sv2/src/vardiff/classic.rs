@@ -267,6 +267,16 @@ pub struct VardiffState {
     /// whole rather than blending it against a zero prior, which would start every channel with a
     /// fictitious idle period.
     rate_seeded: bool,
+    /// The decision threshold used by the most recent evaluation, in percent, or `None` before the
+    /// first one.
+    ///
+    /// Recorded because **the threshold is what bounds settled error**, and nothing outside this
+    /// module could see it. A threshold controller does not act below its threshold, so its settled
+    /// position is bounded by this number and not by any criterion written beneath it — which is why
+    /// tests that want to reason about settled error had been recomputing the threshold formula
+    /// alongside the implementation, free to drift from it. Read it with
+    /// [`VardiffState::last_threshold_pct`].
+    last_threshold_pct: Option<f64>,
 }
 
 impl VardiffState {
@@ -325,10 +335,27 @@ impl VardiffState {
             consecutive_same_direction: 0,
             rate: 0.0,
             rate_seeded: false,
+            last_threshold_pct: None,
         })
     }
 
     /// Sets the count of shares since the last update.
+    /// The decision threshold the most recent evaluation used, in percent, or `None` before the
+    /// first evaluation.
+    ///
+    /// **This is the quantity that bounds settled error.** The controller does not act while the
+    /// deviation is below it, so wherever it stops is inside this number — a criterion asking for a
+    /// settled error tighter than the threshold is asking for precision the trigger cannot deliver.
+    /// Exposed so that a test can assert against the threshold actually used rather than against a
+    /// copy of the formula, which would be free to drift from the implementation it is checking.
+    ///
+    /// It is the *directional, discounted* value, i.e. after the tighten multiplier and after the
+    /// same-direction relaxation — the number the deviation was actually compared against, not the
+    /// branch's base.
+    pub fn last_threshold_pct(&self) -> Option<f64> {
+        self.last_threshold_pct
+    }
+
     pub fn set_shares_since_last_update(&mut self, shares_since_last_update: u32) {
         self.shares_since_last_update = shares_since_last_update;
     }
@@ -786,6 +813,7 @@ impl Vardiff for VardiffState {
             tightening,
             same_direction_run,
         );
+        self.last_threshold_pct = Some(threshold);
 
         debug!(
             target: "vardiff",

@@ -139,6 +139,13 @@ pub(super) struct Trial {
     pub(super) shares_fed: u64,
     /// Where difficulty ended up.
     pub(super) final_hashrate: f32,
+    /// The decision threshold in force at the last evaluation, in percent, read from the controller
+    /// rather than recomputed.
+    ///
+    /// The controller does not act below its threshold, so the settled position is inside this
+    /// number. Tests that want to reason about settled error need it, and recomputing the formula
+    /// here would let the copy drift from the implementation being checked.
+    pub(super) final_threshold_pct: f64,
 }
 
 /// Drives one trajectory: the miner delivers whatever `delivered` says, the feed samples the share
@@ -164,6 +171,7 @@ pub(super) fn run_trial(
     let mut errors: Vec<f64> = Vec::new();
     let mut worst_over_pct = f64::MIN;
     let mut final_error_pct = 0.0;
+    let mut final_threshold_pct = f64::NAN;
 
     while elapsed < warm_up_secs + measured_secs {
         elapsed += TICK_SECS;
@@ -188,7 +196,12 @@ pub(super) fn run_trial(
         }
 
         let target = target_for(believed, spm);
-        if let Ok(Some(next)) = vardiff.try_vardiff(believed, &target, spm) {
+        let fired = vardiff.try_vardiff(believed, &target, spm);
+        if measuring {
+            // After the call, so it is the threshold this evaluation used.
+            final_threshold_pct = vardiff.last_threshold_pct().unwrap_or(f64::NAN);
+        }
+        if let Ok(Some(next)) = fired {
             believed = next;
             if measuring {
                 retargets += 1;
@@ -205,6 +218,7 @@ pub(super) fn run_trial(
         retargets,
         shares_fed,
         final_hashrate: believed,
+        final_threshold_pct,
     }
 }
 
@@ -236,6 +250,7 @@ pub(super) fn measure(
         retargets: pick(runs.iter().map(|r| r.retargets as f64).collect()) as usize,
         shares_fed: pick(runs.iter().map(|r| r.shares_fed as f64).collect()) as u64,
         final_hashrate: pick(runs.iter().map(|r| r.final_hashrate as f64).collect()) as f32,
+        final_threshold_pct: pick(runs.iter().map(|r| r.final_threshold_pct).collect()),
     }
 }
 

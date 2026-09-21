@@ -374,3 +374,66 @@ fn the_absolute_settled_error_is_held_not_merely_the_relative_one() {
         worst.0, worst.1
     );
 }
+
+/// **The settled position is inside the threshold that produced it**, at every cell and share rate.
+///
+/// This is the property every settled-error criterion in this suite depends on and none of them
+/// stated. A threshold controller does not act while the deviation is below its threshold, so
+/// wherever it stops is inside that number — which means **the threshold, not any written bound, is
+/// what limits settled error.** A criterion asking for a settled error tighter than the threshold is
+/// asking the controller to be more precise than its own trigger, and no parameter choice satisfies
+/// that.
+///
+/// It is not a tautology. The controller compares its *estimate* against its *belief*, while the
+/// reading here is belief against *truth*. They coincide only while the estimator is tracking, so
+/// this asserts that it is — a real property, and the one that makes threshold-relative reasoning
+/// about settled error valid at all.
+///
+/// The threshold is read from [`VardiffState::last_threshold_pct`] rather than recomputed. Three
+/// records' worth of analysis had been recomputing the formula alongside the implementation, which is
+/// exactly the arrangement in which a copy drifts from what it checks.
+#[test]
+fn the_settled_position_is_inside_the_threshold_that_produced_it() {
+    const CELLS: [(f64, f64); 4] = [(5.0, 0.20), (2.0, 0.08), (10.0, 0.40), (40.0, 0.50)];
+    const TRIALS: usize = 40;
+
+    let mut tightest = f64::MAX;
+    for (rate_pct_per_hr, drop) in CELLS {
+        for spm in [2.0f32, 12.0] {
+            let trial = measure(
+                &declining(rate_pct_per_hr, drop),
+                spm,
+                ONE_HOUR,
+                3 * ONE_HOUR,
+                TRIALS,
+            );
+            let report = format!(
+                "{rate_pct_per_hr} %/hr losing {:.0}% at {spm} spm: settled {:+.2}%, threshold in \
+                 force {:.2}%",
+                drop * 100.0,
+                trial.final_error_pct,
+                trial.final_threshold_pct
+            );
+            assert!(
+                trial.final_threshold_pct.is_finite(),
+                "no evaluation recorded a threshold -- the accessor is not being reached -- {report}"
+            );
+            assert!(
+                trial.final_error_pct.abs() < trial.final_threshold_pct,
+                "the settled position escaped the threshold that produced it, which would mean the \
+                 estimator is not tracking and threshold-relative reasoning about settled error is \
+                 invalid -- {report}"
+            );
+            tightest = tightest.min(trial.final_threshold_pct / trial.final_error_pct.abs());
+        }
+    }
+    // Containment is not vacuous: the tightest cell sits within a small multiple of its threshold.
+    // Measured ratios run 6.0x to 84.5x, so 10x binds on the tightest cell at 1.67x. The guard is
+    // oriented to fail when containment stops being *exercised* — if every cell moved far inside its
+    // threshold this test would assert nothing, and that is the regression worth catching here.
+    assert!(
+        tightest < 10.0,
+        "every cell settled more than 10x inside its threshold, so this test is not exercising \
+         containment and its assertion is vacuous (tightest ratio {tightest:.1}x)"
+    );
+}
