@@ -1,8 +1,7 @@
 # Vardiff: what the controller does, and where it fails
 
 A reference for `src/vardiff/classic.rs`. Every number here is produced by a test in
-`src/vardiff/test/`, named inline, so this file cannot drift from the code without a test failing.
-Run it with:
+`src/vardiff/test/`, named inline. Run them with:
 
 ```
 cargo test -p channels_sv2 --lib vardiff -- --nocapture
@@ -10,6 +9,15 @@ cargo test -p channels_sv2 --lib vardiff -- --nocapture
 
 The controller's job: choose a difficulty so a miner submits `r*` shares a minute. It cannot measure
 hashrate, only its own tracking error, and it must decide from a share stream that is Poisson.
+
+**What in this document is guaranteed, and what is not.** Every reference of the form
+`<file>.rs::<test>` is resolved
+against the test tree by `record.rs::every_test_named_by_the_record_exists`, so a renamed test breaks the
+build rather than the reader. The *figures* carry no such guarantee and are **illustrative**: the suite
+asserts inequalities with headroom -- `> 5`, `gap > 3`, `> 1.2x` -- because at twenty to forty trials a
+point value is not a claim, so the numbers quoted here are printed by those tests rather than asserted by
+them, and a drift inside an assertion's headroom would leave the suite green and these figures stale. The
+assertions are the contract; treat the numbers as the reading that produced them.
 
 ---
 
@@ -83,7 +91,7 @@ reachable rate puts the dense branch on sparse data, which is worse than the hon
 | **sustained decline** | acted on at every rate; settles within 5.6% over / 11.1% under | `regimes.rs` |
 | **single outage** | eased to the 9× displacement bound and stops there, at every rate | `regimes.rs` |
 | **steady channel** | ≤4 retargets an hour, standing offset within 12% | `regimes.rs` |
-| **swing near `τ`** | averaged rather than followed — a resonance, not a general regression | `regimes.rs` |
+| **swing above `τ`** | read less accurately at 2.5τ than at 20τ — the long flank only; `regimes.rs` does not bracket the memory | `regimes.rs` |
 | **cold start, under-declared** | converges in 4–9 retargets for 10× and 100× errors; geometric | `cold_start.rs` |
 | **cold start, over-declared** | **locks** at sparse rates — see below | `cold_start.rs` |
 | **repeated outage** | chronic under-difficulty, 1.6–3.4× — see below | `outage.rs` |
@@ -114,8 +122,11 @@ sparse channels.
 
 ### A channel that flaps sits persistently under-difficulty
 
-Settled error over 12 h, by cycle length at 50% duty: −123.69% at 30 min, −72.76% at 60, −20.60% at
-120 (2 spm; 12 spm is 2–3× milder). Always under, never over, at every rate and cycle.
+Median absolute error over 12 h at 50% duty, 2 spm: 168% on a 30 min cycle, 107% on 60, 63% on 120. At
+12 spm the same cells are 1.1× to 3.6× milder, not a constant factor. Always under-difficulty, never
+over, at every rate and cycle. Medians rather than final readings, because a cyclic trajectory's last
+tick lands at a fixed phase that differs between cells -- comparing finals across cells would
+manufacture an effect out of phase alone.
 
 The cause is the tighten asymmetry, confirmed by mutation: weakening `TIGHTEN_MULTIPLIER` from 8.0 to
 3.0 shrinks the worst cell by the same factor of 2.7, while retargets rise from 98 to 157. Easing on
@@ -124,8 +135,15 @@ displacement bound is *not* what binds here, which is asserted separately — th
 share a fix.
 
 Cost, in the two units an operator pays in and neither of them payout: **5.1× the intended share
-load** at 2 spm, 4.1× at 12, and 8.2–18.0 retargets an hour against the 4 a stable channel is held
-to. It is a resonance: the cost peaks near `τ` and falls off either side.
+load** at 2 spm, 4.1× at 12, and 8.2–18.0 retargets an hour against the **0.25–0.33 a stable channel
+actually makes** -- a churn multiple of 33× to 55×. (Against `regimes.rs`'s `<= 4` an hour *ceiling*
+it would read 2–4.5×, which is how this was first quoted and which understates it by an order of
+magnitude.)
+
+It is a band rather than a general degradation, with an **interior peak at 5τ** -- 87% at `τ`, 168% at
+`5τ`, 32% at `40τ`, falling away on both flanks. First recorded as "peaks near `τ`" from a sweep whose
+shortest cycle was already `5τ`, so the monotone falloff seen was the far flank of a maximum that had
+not been located; the position was wrong by a factor of five.
 
 ## 6. Constants that are not free choices
 

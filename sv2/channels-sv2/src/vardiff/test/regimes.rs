@@ -252,7 +252,16 @@ fn a_stable_channel_is_left_largely_alone() {
 /// typical-case one -- the estimate is never far away, it is just never right either.
 #[test]
 fn a_miner_swinging_near_the_memory_is_averaged_rather_than_followed() {
-    /// Half periods either side of the estimator's memory, in seconds.
+    /// Two half periods, **both above** the estimator's 360 s memory: 2.5x it and 20x it.
+    ///
+    /// The names say "near" and "far above" and the comparison is between those two, so what this test
+    /// establishes is the *long-side* falloff -- a swing closer to the memory is read less accurately than
+    /// one far above it. It does not bracket the memory and does not locate a maximum. An earlier version
+    /// of this comment said "either side of", which was wrong: nothing here is below 360 s.
+    ///
+    /// `outage.rs::the_cost_has_an_interior_peak_above_the_estimator_memory` sweeps both flanks for the
+    /// related disturbance and finds the maximum at 5x the memory rather than at it, so "near the memory"
+    /// should be read as shorthand for this pair of points and not as a claim about where the worst case is.
     const NEAR_MEMORY_SECS: u64 = 900;
     const FAR_ABOVE_MEMORY_SECS: u64 = 7200;
     /// How much worse the near-memory error must be for the resonance to be real.
