@@ -6,12 +6,15 @@
 //! repair is to replace the constant and the gate with one rate-aware rule -- cap the window where the
 //! bar reaches the estimator's spread, at every rate.
 //!
-//! **Measured, that repair is worse than what it replaces, for two independent reasons**, and both are
-//! recorded below rather than argued. It is *looser* than 900 s above about 8 shares a minute, because
-//! the dense bar decays as `1/window` while `sigma` falls only as `1/sqrt(r)` -- so it costs exactly the
-//! retargets the cap exists to prevent. And capping the sparse window costs settled over-difficulty on a
-//! slow decline however far out the cap is placed, so the seam gate is load-bearing rather than a
-//! conservative default.
+//! **Measured, that repair is worse than what it replaces**, and it is rejected below rather than argued
+//! against. The reason that holds under every condition tested: it is *looser* than 900 s above about 8
+//! shares a minute, because the dense bar decays as `1/window` while `sigma` falls only as `1/sqrt(r)` --
+//! so it costs exactly the retargets the cap exists to prevent.
+//!
+//! A second reason was recorded here and **has since been narrowed**. Capping the sparse window costs
+//! settled over-difficulty on a slow decline, which read as the seam gate being load-bearing; measured
+//! again with the miner's own rate wandering, that cost disappears (`wander.rs`). So it is a property of
+//! a perfectly steady miner, it is scoped that way below, and the rejection rests on the first reason.
 //!
 //! What survives is the residue: the shipped form, never looser than the matched window. It keeps the
 //! gate, so it cannot reintroduce the sparse failure, and it is a no-op above 8 shares a minute where the
@@ -113,18 +116,22 @@ fn the_matched_rule_helps_below_the_crossing_and_hurts_above_it() {
     );
 }
 
-/// **Capping the sparse window costs settled over-difficulty on a slow decline, at any cap.**
+/// **Against a perfectly steady miner, capping the sparse window costs a slow decline at any cap.**
 ///
-/// The second reason, and the more important one, because it says the seam gate is load-bearing. The
-/// research branch measured +29.9% settled over-difficulty from capping sparse windows at 900 s. Moving
-/// the cap out by an order of magnitude, to the 8600 s the estimator's spread asks for, does not remove
-/// the cost — it attenuates it to **+3.27 pp** on the slow cell.
+/// The research branch measured +29.9% settled over-difficulty from capping sparse windows at 900 s.
+/// Moving the cap out by an order of magnitude, to the 8600 s the estimator's spread asks for, does not
+/// remove the cost -- it attenuates it to **+3.27 pp** on the slow cell. The cell it hurts is the telling
+/// part: a 40 %/hr decline crosses any bar quickly and is unaffected, while the 5 %/hr decline, the one
+/// that needs the bar to keep falling over a long window, pays all of it.
 ///
-/// The cell it hurts is the telling part. A 40 %/hr decline crosses any bar quickly and is unaffected;
-/// it is the 5 %/hr decline, the one that needs the bar to keep falling over a long window, that pays.
-/// That is the same shape as the corpus's own binding gate cell, a 1 %/hr decline at 2 spm.
+/// **Scoped to a steady miner deliberately, and that scope is the correction.** This was first recorded
+/// as the seam gate being load-bearing. Re-measured with the miner's own rate wandering at the worst
+/// values measured on hardware, the cost is -0.31 pp -- gone, because the shipped arm has itself degraded
+/// by more than the cap's effect. See `the_caps_sparse_cost_is_wander_free_but_its_crossing_cost_is_not`.
+/// The reading below is still worth keeping, because it is the one that isolates the cap's own effect from
+/// the disturbance; it is just not evidence about a deployment.
 #[test]
-fn capping_the_sparse_window_costs_a_slow_decline_at_any_cap() {
+fn capping_the_sparse_window_costs_a_slow_decline_without_wander() {
     const TRIALS: usize = 40;
     /// What the slow cell pays, measured. Held as a range: a cost that has vanished means the sparse
     /// branch changed and the seam gate may no longer be needed, which is worth failing over.

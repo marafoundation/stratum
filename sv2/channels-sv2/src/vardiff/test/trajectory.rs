@@ -39,6 +39,8 @@ pub(super) const START_HASHRATE: f32 = 1.0e12;
 pub(super) const SEED: u64 = 0x5EED_1234_5678_9ABC;
 /// Clock origin, well clear of zero so a backwards step has room.
 const CLOCK_ORIGIN: u64 = 1_000_000;
+/// Salt for the wander stream, so adding wander to a trial does not disturb its share sampling.
+const WANDER_SEED_SALT: u64 = 0x_4AD3_0000_0000_0001;
 
 /// XorShift64, so sampling is reproducible without a dev-dependency.
 pub(super) struct XorShift64(u64);
@@ -100,13 +102,85 @@ pub(super) fn sample_poisson(rng: &mut XorShift64, lambda: f64) -> u32 {
         // leaving `k` at zero, and an unchecked decrement would read as four billion arrivals.
         return k.saturating_sub(1);
     }
-    let (u1, u2) = (rng.next_f64(), rng.next_f64());
-    let z = (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos();
-    let raw = lambda + lambda.sqrt() * z;
+    let raw = lambda + lambda.sqrt() * sample_standard_normal(rng);
     if raw > 0.0 {
         raw.min(MAX_SAMPLED_SHARES as f64).round() as u32
     } else {
         0
+    }
+}
+
+/// One standard normal draw, Box-Muller.
+///
+/// Shared with `sample_poisson`'s large-mean branch rather than written twice, so a trajectory that
+/// crosses `KNUTH_LIMIT` and one that carries wander draw from the same generator.
+fn sample_standard_normal(rng: &mut XorShift64) -> f64 {
+    let (u1, u2) = (rng.next_f64(), rng.next_f64());
+    (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos()
+}
+
+/// Physical hashrate wander: a miner whose delivered rate drifts on its own, independent of anything
+/// the controller does.
+///
+/// **Every other trajectory in this module holds the miner perfectly steady between disturbances, and
+/// real ones do not.** Measured on the truth-poller archive, per unit, detrended so slow drift is not
+/// read as correlation: an immersion unit wanders 3.00% with an integral timescale of 301 s, and an
+/// air-cooled unit that ran to 94 C wanders 12.58% at 2269 s. The second matters more than its size
+/// suggests, because wander slower than the estimator's memory is not averaged away -- only
+/// `T_c / (T_c + tau)` of it is removed, so essentially all of the hot unit's survives into the
+/// estimate and sits on top of the counting noise.
+///
+/// Modelled as an Ornstein-Uhlenbeck process in log rate, which is the standard choice for a
+/// mean-reverting disturbance and the one the research branch's own wander test used: it has exactly the
+/// two parameters that were measured, a stationary spread and a timescale, and it cannot wander away
+/// without bound.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Wander {
+    /// Stationary relative standard deviation of the delivered rate.
+    pub(super) sigma: f64,
+    /// Integral timescale, in seconds. Wander slower than `tau` is what the estimator cannot remove.
+    pub(super) t_c_secs: u64,
+}
+
+impl Wander {
+    /// The air-cooled unit that ran hot: the worst measured, and the one the gate should be judged at.
+    pub(super) const HOT_AIR: Self = Self {
+        sigma: 0.1258,
+        t_c_secs: 2269,
+    };
+
+    /// The immersion unit: the best measured, for contrast.
+    pub(super) const IMMERSION: Self = Self {
+        sigma: 0.0300,
+        t_c_secs: 301,
+    };
+
+    /// How much of it survives the estimator: `sigma * sqrt(T_c / (T_c + tau))`.
+    ///
+    /// The reason the hot unit is the interesting one. At the shipped memory it keeps 93% of its wander
+    /// while the immersion unit keeps 67% of a spread four times smaller — so the hot unit's disturbance
+    /// arrives at the estimator essentially intact, on top of the counting noise.
+    ///
+    /// **The square root is the corpus's, against the corpus's own prose.** Its text says "the reduction
+    /// is `T_c/(T_c+tau)`", but all three of its measured rows fit the root and none fit the bare ratio:
+    /// 3.58% at `T_c` 1047 reads 3.09% (root 0.863, ratio 0.744), 3.00% at 301 reads 2.03% (0.675 against
+    /// 0.455), and 12.58% at 2269 reads 11.68% (0.929 against 0.863). Three rows agreeing with the root
+    /// and disagreeing with the sentence beside them settles it; `the_wander_model_matches_the_measured_units`
+    /// pins that, so this cannot quietly revert to the prose.
+    pub(super) fn seen_by_estimator(&self, tau_secs: u64) -> f64 {
+        self.sigma * (self.t_c_secs as f64 / (self.t_c_secs + tau_secs) as f64).sqrt()
+    }
+
+    /// Advances the log-rate state by `dt_secs` and returns the new multiplier on the delivered rate.
+    ///
+    /// `x <- rho*x + eps`, with `rho = e^(-dt/T_c)` and `eps` scaled so the stationary spread is
+    /// `sigma` whatever `dt` is -- which is what makes the disturbance a property of the miner rather
+    /// than of how often the harness happens to look.
+    fn advance(&self, log_state: &mut f64, dt_secs: u64, rng: &mut XorShift64) -> f64 {
+        let rho = (-(dt_secs as f64) / (self.t_c_secs as f64)).exp();
+        let step_sd = self.sigma * (1.0 - rho * rho).sqrt();
+        *log_state = rho * *log_state + step_sd * sample_standard_normal(rng);
+        log_state.exp()
     }
 }
 
@@ -190,6 +264,7 @@ pub(super) fn run_trial(
     measured_secs: u64,
     seed: u64,
     arm: Arm,
+    wander: Option<Wander>,
 ) -> Trial {
     let clock = Arc::new(MockClock::new(CLOCK_ORIGIN));
     let fresh = VardiffState::new_with_clock(TEST_MIN_ALLOWED_HASHRATE, clock.clone())
@@ -203,6 +278,7 @@ pub(super) fn run_trial(
     };
 
     let mut believed = START_HASHRATE;
+    let mut wander_log = 0.0f64;
     let mut elapsed = 0;
     let mut retargets = 0;
     let mut shares_fed = 0u64;
@@ -215,7 +291,17 @@ pub(super) fn run_trial(
         elapsed += TICK_SECS;
         clock.advance(TICK_SECS);
 
-        let delivered_now = delivered(elapsed);
+        // Wander multiplies the trajectory rather than replacing it, so a declining miner that also
+        // wanders is both, which is the realistic case and the one the gate is judged on.
+        let delivered_now = delivered(elapsed)
+            * match wander {
+                Some(w) => w.advance(
+                    &mut wander_log,
+                    TICK_SECS,
+                    &mut XorShift64::new(seed ^ WANDER_SEED_SALT ^ elapsed),
+                ),
+                None => 1.0,
+            };
         let lambda = (delivered_now / believed as f64) * spm as f64 * (TICK_SECS as f64 / 60.0);
         let shares = sample_poisson(&mut XorShift64::new(seed.wrapping_add(elapsed)), lambda);
         for _ in 0..shares {
@@ -287,6 +373,30 @@ pub(super) fn measure_arm(
     trials: usize,
     arm: Arm,
 ) -> Trial {
+    measure_arm_wander(
+        delivered,
+        spm,
+        warm_up_secs,
+        measured_secs,
+        trials,
+        arm,
+        None,
+    )
+}
+
+/// [`measure_arm`], with the miner's own rate wandering. See [`Wander`].
+///
+/// Same seeds as the wander-free call, and the wander stream is salted rather than shared, so a pair of
+/// readings differs only by the disturbance.
+pub(super) fn measure_arm_wander(
+    delivered: &impl Fn(u64) -> f64,
+    spm: f32,
+    warm_up_secs: u64,
+    measured_secs: u64,
+    trials: usize,
+    arm: Arm,
+    wander: Option<Wander>,
+) -> Trial {
     let runs: Vec<Trial> = (0..trials)
         .map(|i| {
             run_trial(
@@ -296,6 +406,7 @@ pub(super) fn measure_arm(
                 measured_secs,
                 SEED.wrapping_add(i as u64),
                 arm,
+                wander,
             )
         })
         .collect();
