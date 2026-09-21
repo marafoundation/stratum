@@ -19,11 +19,56 @@ use crate::vardiff::classic::{
 
 /// The estimator's own relative spread, read from the controller rather than recomputed here.
 ///
-/// A local copy of `sqrt(30 / (r * tau))` would be a second implementation of the quantity every
-/// threshold in this file is compared against, free to drift from the one the controller uses. Wrapped
-/// only to take the `f64` these tests work in.
+/// A local copy would be a second implementation of the quantity every threshold in this file is
+/// compared against, free to drift from the one the controller uses. Wrapped only to take the `f64`
+/// these tests work in.
 fn estimator_spread(spm: f64) -> f64 {
     VardiffState::estimator_spread(spm as f32)
+}
+
+/// **The closed form for `sigma` is an approximation, and this is where it holds.**
+///
+/// `1/sqrt(lambda * n_eff)` is exact; `sqrt(30 / (r * tau))` is its limit as the evaluation interval
+/// shrinks against `tau`, because `n_eff -> 2*tau/dt` there. The corpus quotes the closed form
+/// throughout and the pinned instrument computes the exact one, so the two must be shown to agree at the
+/// cadence the quoting is done at -- and to diverge away from it, or "approximation" is an unsupported
+/// word.
+///
+/// It also settles a disagreement. The corpus carries a second convention, `1/sqrt(r*tau/60)`, which is
+/// this one without the factor of two from the effective window being `2*tau`; it reads 16.7% at 6 shares
+/// a minute against the 11.8% the instrument computes. The instrument is what the measurements were made
+/// with, so the factor of two is real and the other convention is the one to stop using.
+#[test]
+fn the_closed_form_for_sigma_holds_at_the_nominal_cadence() {
+    let closed = |spm: f64| (30.0 / (spm * EWMA_TAU_SECS as f64)).sqrt();
+
+    for spm in [2.0f64, 6.0, 12.0, 30.0] {
+        let exact = VardiffState::estimator_spread_at(spm as f32, 60);
+        let error = (exact / closed(spm) - 1.0).abs();
+        // 0.115% at the nominal cadence, independent of the rate: both forms scale as 1/sqrt(r), so the
+        // discrepancy is a function of dt/tau alone.
+        assert!(
+            error < 0.002,
+            "at {spm} spm the exact spread is {exact:.6} against the closed form's {:.6}, off by              {:.3}% -- more than the 0.2% that makes quoting the closed form safe at this cadence",
+            closed(spm),
+            error * 100.0
+        );
+        // The convention that drops the factor of two is not a rounding difference.
+        let without_the_two = 1.0 / (spm * EWMA_TAU_SECS as f64 / 60.0).sqrt();
+        assert!(
+            (without_the_two / exact - 1.0).abs() > 0.4,
+            "the no-factor-of-two convention should read about sqrt(2) high; at {spm} spm it read              {without_the_two:.4} against {exact:.4}, which is close enough that the two conventions              cannot be told apart and this test cannot settle which is right"
+        );
+    }
+
+    // And it stops holding once the interval is a real fraction of tau, which is why the exact form is
+    // what the code carries.
+    let long = VardiffState::estimator_spread_at(6.0, 900);
+    assert!(
+        (long / closed(6.0) - 1.0).abs() > 0.1,
+        "at a 900 s interval the closed form should be visibly wrong ({long:.4} against {:.4}); if it          is not, the approximation is better than described and the exact form is unnecessary machinery",
+        closed(6.0)
+    );
 }
 
 /// The dense bar once the window has grown to the cap, as a fraction.
@@ -128,7 +173,7 @@ fn the_dense_evidence_term_has_one_degree_of_freedom() {
 /// Both answer the same question: below which share rate is the dense branch's bar untrustworthy?
 /// [`SPARSE_SPM_SEAM`] answers it by switching to a count-based bar. [`WINDOW_CAP_SECS`] answers it by
 /// holding the bar up so it cannot decay under the estimator's own spread. One rate, two constants, and
-/// nothing making them agree -- so they do not: the cap is `sigma`-matched at **8.05** shares a minute
+/// nothing making them agree -- so they do not: the cap is `sigma`-matched at **8.03** shares a minute
 /// while the seam sits at **6.00**, and in the band between them the shipped controller runs the dense
 /// branch with a bar that its own wobble clears for part of every cap cycle.
 ///
@@ -159,14 +204,14 @@ fn the_seam_and_the_window_cap_disagree_about_the_same_rate() {
          {WINDOW_CAP_SECS}s"
     );
     assert_eq!(
-        seam_matched_cap, 593,
-        "the seam's own matched window is {seam_matched_cap}s, not the 593 recorded here and in \
+        seam_matched_cap, 594,
+        "the seam's own matched window is {seam_matched_cap}s, not the 594 recorded here and in \
          window_cap_form.rs"
     );
 
     assert!(
-        (cap_matched_spm - 8.05).abs() < 0.05,
-        "the window cap is sigma-matched at {cap_matched_spm:.2} spm, not the recorded 8.05. If the \
+        (cap_matched_spm - 8.03).abs() < 0.05,
+        "the window cap is sigma-matched at {cap_matched_spm:.2} spm, not the recorded 8.03. If the \
          cap, the floor, the evidence term or tau moved, this is the constant that has to be re-read \
          with them"
     );

@@ -37,13 +37,13 @@ fn the_matched_window_crosses_the_shipped_constant_at_eight_shares_a_minute() {
 
     // Below the seam the count-based bar decays slowly, so the matched window is hours. That is why a
     // 900 s cap stranded declining sparse channels: it is an order of magnitude too tight there.
-    assert_eq!(at(2.0), Some(8574), "2 spm");
-    assert_eq!(at(4.0), Some(11343), "4 spm");
+    assert_eq!(at(2.0), Some(8600), "2 spm");
+    assert_eq!(at(4.0), Some(11383), "4 spm");
     // Above it the bar decays as 1/window, so the matched window is minutes — and it crosses 900 s at
     // about 8, which is the whole reason the rule is not uniformly tighter than the constant.
-    assert_eq!(at(6.0), Some(593), "6 spm, tighter than the constant");
-    assert_eq!(at(8.0), Some(893), "8 spm, within a tick of it");
-    assert_eq!(at(12.0), Some(1708), "12 spm, looser than it");
+    assert_eq!(at(6.0), Some(594), "6 spm, tighter than the constant");
+    assert_eq!(at(8.0), Some(895), "8 spm, within a tick of it");
+    assert_eq!(at(12.0), Some(1713), "12 spm, looser than it");
     // And where the floor alone already exceeds the estimator's spread there is nothing to protect.
     assert_eq!(
         at(60.0),
@@ -69,8 +69,8 @@ fn stable_at(spm: f32, arm: Arm) -> Trial {
 
 /// **The `sigma`-matched rule is not uniformly tighter, and above the crossing it costs retargets.**
 ///
-/// The first of the two reasons it is rejected. At 6 shares a minute its window is 593 s against 900 and
-/// it does better than the shipped form; at 12 its window is 1708 s and it does worse. A rule that is
+/// The first of the two reasons it is rejected. At 6 shares a minute its window is 594 s against 900 and
+/// it does better than the shipped form; at 12 its window is 1713 s and it does worse. A rule that is
 /// looser than the constant it replaces, in the band where most channels run, is not a repair.
 ///
 /// Asserted in both directions, because the finding is the *sign change* rather than either reading: a
@@ -117,7 +117,7 @@ fn the_matched_rule_helps_below_the_crossing_and_hurts_above_it() {
 ///
 /// The second reason, and the more important one, because it says the seam gate is load-bearing. The
 /// research branch measured +29.9% settled over-difficulty from capping sparse windows at 900 s. Moving
-/// the cap out by an order of magnitude, to the 8574 s the estimator's spread asks for, does not remove
+/// the cap out by an order of magnitude, to the 8600 s the estimator's spread asks for, does not remove
 /// the cost — it attenuates it to **+3.27 pp** on the slow cell.
 ///
 /// The cell it hurts is the telling part. A 40 %/hr decline crosses any bar quickly and is unaffected;
@@ -171,7 +171,7 @@ fn capping_the_sparse_window_costs_a_slow_decline_at_any_cap() {
         slow_cost > lo && slow_cost < hi,
         "the slow sparse cell paid {slow_cost:+.2} pp for a capped window, outside the measured \
          {lo:.1}-{hi:.1} pp. Below the range, capping sparse has stopped costing anything and the seam \
-         gate may be removable; above it, the cost has grown and the 8574 s cap is further from safe \
+         gate may be removable; above it, the cost has grown and the 8600 s cap is further from safe \
          than recorded"
     );
 }

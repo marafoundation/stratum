@@ -272,6 +272,16 @@ pub(crate) const WINDOW_CAP_SECS: u64 = 900;
 /// what it bounds is how often [`MAX_STEP_RATIO`] may be spent.
 const MIN_EVALUATION_INTERVAL_SECS: u64 = 15;
 
+/// Cadence the controller is nominally evaluated at, in seconds.
+///
+/// Not enforced and not enforceable here: how often `try_vardiff` is called is the caller's, and
+/// [`MIN_EVALUATION_INTERVAL_SECS`] is the only thing this crate says about it. It exists because the
+/// estimator's spread depends on the interval as well as the rate, so any design-time comparison of a
+/// threshold against that spread has to name a cadence, and this is the one the figures in this file are
+/// quoted at.
+#[allow(dead_code)] // read by the sigma helpers, which are test-only.
+const NOMINAL_TICK_SECS: u64 = 60;
+
 /// Time constant of the EWMA estimator, in seconds.
 ///
 /// Old evidence decays on the clock at `e^(−Δt/tau)`, which is what makes the window unable to
@@ -547,15 +557,39 @@ impl VardiffState {
         self.rate
     }
 
-    /// The estimator's own relative spread at a target share rate, as a fraction.
+    /// The estimator's own relative spread, as a fraction, for a channel evaluated every `dt_secs`.
     ///
-    /// `sigma = sqrt(30 / (r * tau))`, from the EWMA's variance against its effective window of
-    /// `2*tau`. It is the scale every threshold has to be read against: a bar below `sigma` is a bar
-    /// the controller's own wobble clears, so a deviation that crosses it is as likely to be the
-    /// estimator moving as the miner.
+    /// It is the scale every threshold has to be read against: a bar below `sigma` is a bar the
+    /// controller's own wobble clears, so a deviation that crosses it is as likely to be the estimator
+    /// moving as the miner.
+    ///
+    /// `1 / sqrt(lambda * n_eff)`: `lambda` shares arrive per evaluation and the filter averages
+    /// `n_eff = (1 + alpha) / (1 - alpha)` of them. This is the exact form rather than the closed one,
+    /// because the closed form is an approximation whose range of validity is worth not having to
+    /// remember — see `the_closed_form_for_sigma_holds_at_the_nominal_cadence`. Matches the pinned
+    /// research instrument's `ratio_std_for`.
+    #[cfg(test)]
+    pub(crate) fn estimator_spread_at(shares_per_minute: f32, dt_secs: u64) -> f64 {
+        if shares_per_minute <= 0.0 || dt_secs == 0 {
+            return f64::INFINITY;
+        }
+        let alpha = (-(dt_secs as f64) / (EWMA_TAU_SECS as f64)).exp();
+        if !(0.0..1.0).contains(&alpha) {
+            return f64::INFINITY;
+        }
+        let n_eff = (1.0 + alpha) / (1.0 - alpha);
+        let lambda = shares_per_minute as f64 * (dt_secs as f64 / 60.0);
+        1.0 / (lambda * n_eff).sqrt()
+    }
+
+    /// [`Self::estimator_spread_at`] at [`NOMINAL_TICK_SECS`].
+    ///
+    /// The spread depends on how often the controller is *asked*, which is a property of the caller and
+    /// not of this crate. Every use of `sigma` here is a design-time comparison against a threshold, so
+    /// it needs one cadence to quote, and the nominal one is it.
     #[cfg(test)]
     pub(crate) fn estimator_spread(shares_per_minute: f32) -> f64 {
-        (30.0 / (shares_per_minute as f64 * EWMA_TAU_SECS as f64)).sqrt()
+        Self::estimator_spread_at(shares_per_minute, NOMINAL_TICK_SECS)
     }
 
     /// Window at which this rate's threshold has decayed to the estimator's own spread, in seconds, or
