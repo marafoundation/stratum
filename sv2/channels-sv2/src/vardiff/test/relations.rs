@@ -11,21 +11,19 @@
 //! two rates 34% apart.
 
 use crate::vardiff::classic::{
-    EVIDENCE_AT_ONE_MINUTE, EWMA_TAU_SECS, MAX_DIRECTION_DISCOUNT,
+    VardiffState, EVIDENCE_AT_ONE_MINUTE, EWMA_TAU_SECS, MAX_DIRECTION_DISCOUNT,
     MIN_EFFECTIVE_TIGHTEN_MULTIPLIER, MIN_THRESHOLD_FRACTION, REFERENCE_SPM, SPARSE_SPM_SEAM,
     STEP_FRACTION_BASE, STEP_FRACTION_ENGAGING_THE_EASING_BOUND, STEP_FRACTION_GROWTH,
     STEP_FRACTION_MAX, TIGHTEN_MULTIPLIER, WINDOW_CAP_SECS,
 };
 
-/// The estimator's own relative spread at a target share rate, as a fraction.
+/// The estimator's own relative spread, read from the controller rather than recomputed here.
 ///
-/// `sigma = sqrt(30 / (r * tau))`, from the EWMA's variance against its effective window of `2*tau`.
-/// Computed from [`EWMA_TAU_SECS`] rather than tabulated, so it follows the shipped memory.
-///
-/// It is the scale every threshold has to be read against: a bar below `sigma` is a bar the
-/// controller's own wobble clears, so the deviation that crosses it is as likely to be noise as signal.
+/// A local copy of `sqrt(30 / (r * tau))` would be a second implementation of the quantity every
+/// threshold in this file is compared against, free to drift from the one the controller uses. Wrapped
+/// only to take the `f64` these tests work in.
 fn estimator_spread(spm: f64) -> f64 {
-    (30.0 / (spm * EWMA_TAU_SECS as f64)).sqrt()
+    VardiffState::estimator_spread(spm as f32)
 }
 
 /// The dense bar once the window has grown to the cap, as a fraction.
@@ -149,15 +147,21 @@ fn the_seam_and_the_window_cap_disagree_about_the_same_rate() {
         / (2.0 * a);
     let cap_matched_spm = u * u;
 
-    // And the converse: the cap the seam's own rate would ask for.
-    let seam_matched_cap =
-        60.0 * EVIDENCE_AT_ONE_MINUTE * (SPARSE_SPM_SEAM as f64 / REFERENCE_SPM).sqrt()
-            / (estimator_spread(SPARSE_SPM_SEAM as f64) - MIN_THRESHOLD_FRACTION);
+    // And the converse: the cap the seam's own rate would ask for. Read from the controller, which
+    // solves this per branch, rather than recomputed -- `window_cap_form.rs` measures what adopting it
+    // would cost, and both files must be talking about the same number.
+    let seam_matched_cap = VardiffState::sigma_matched_window_secs(SPARSE_SPM_SEAM)
+        .expect("sigma exceeds the floor at the seam, so a matched window exists");
 
     eprintln!(
         "  [relations] the cap is sigma-matched at {cap_matched_spm:.2} spm, the seam sits at \
-         {SPARSE_SPM_SEAM:.2}; matched at the seam the cap would be {seam_matched_cap:.0}s, not \
+         {SPARSE_SPM_SEAM:.2}; matched at the seam the cap would be {seam_matched_cap}s, not \
          {WINDOW_CAP_SECS}s"
+    );
+    assert_eq!(
+        seam_matched_cap, 593,
+        "the seam's own matched window is {seam_matched_cap}s, not the 593 recorded here and in \
+         window_cap_form.rs"
     );
 
     assert!(

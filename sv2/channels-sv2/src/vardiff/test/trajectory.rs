@@ -23,7 +23,11 @@
 use super::{TEST_MIN_ALLOWED_HASHRATE, TEST_SHARES_PER_MINUTE};
 use crate::{
     target::hash_rate_to_target,
-    vardiff::{classic::VardiffState, clock::MockClock, Vardiff},
+    vardiff::{
+        classic::{VardiffState, WindowCapForm},
+        clock::MockClock,
+        Vardiff,
+    },
 };
 use std::sync::Arc;
 
@@ -162,6 +166,11 @@ pub(super) enum Arm {
     /// What the simulation framework selected: below the seam, a bare symmetric Poisson interval with
     /// neither of them.
     ChampionSparse,
+    /// The shipped boundary, with the window capped at the `sigma`-matched value at every rate instead
+    /// of at a constant above the seam and nowhere below it. See `window_cap_form.rs`.
+    SigmaMatchedCap,
+    /// The shipped boundary, with the window cap never looser than the `sigma`-matched window.
+    TighterOfBothCaps,
 }
 
 /// Drives one trajectory: the miner delivers whatever `delivered` says, the feed samples the share
@@ -183,6 +192,8 @@ pub(super) fn run_trial(
     let mut vardiff = match arm {
         Arm::Shipped => fresh,
         Arm::ChampionSparse => fresh.with_champion_sparse_boundary(),
+        Arm::SigmaMatchedCap => fresh.with_window_cap_form(WindowCapForm::SigmaMatched),
+        Arm::TighterOfBothCaps => fresh.with_window_cap_form(WindowCapForm::TighterOfBoth),
     };
 
     let mut believed = START_HASHRATE;

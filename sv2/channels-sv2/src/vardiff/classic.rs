@@ -292,6 +292,33 @@ use super::{
 };
 use std::sync::Arc;
 
+/// Test-only: which of the three window-cap forms a controller applies.
+///
+/// The cap bounds the window the threshold's evidence term is measured over, which bounds the bar from
+/// below. What it should bound it *to* is rate-dependent, and the shipped form answers that with a
+/// constant plus a seam gate. These are the two candidates that were measured against it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowCapForm {
+    /// What ships: [`WINDOW_CAP_SECS`] at or above [`SPARSE_SPM_SEAM`], uncapped below it.
+    Shipped,
+    /// [`VardiffState::sigma_matched_window_secs`] at every rate -- one rule, no seam, no gate.
+    ///
+    /// **Measured and rejected**, for two independent reasons; see `window_cap_form.rs`. It is looser
+    /// than the shipped constant above about 8 shares a minute, so it costs the retargets the cap exists
+    /// to prevent, and capping the sparse window at all costs settled over-difficulty on a slow decline
+    /// however far out the cap is placed.
+    SigmaMatched,
+    /// The shipped form, never looser than the `sigma`-matched window: `min` of the two above the seam,
+    /// uncapped below it.
+    ///
+    /// The residue of the rejected form. It keeps the seam gate, so it cannot reintroduce the sparse
+    /// failure, and it changes nothing above 8 shares a minute, where the constant is already the
+    /// tighter of the two -- so it is confined to the band between the seam and 8, which is where
+    /// `relations.rs` records the two constants disagreeing.
+    TighterOfBoth,
+}
+
 /// Represents the dynamic state for a variable difficulty (Vardiff) connection.
 ///
 /// Tracks performance and adjusts the mining target to achieve a desired share rate.
@@ -373,6 +400,9 @@ pub struct VardiffState {
     /// to look at. See `test/sparse_parity.rs`.
     #[cfg(test)]
     champion_sparse_boundary: bool,
+    /// Test-only: which window-cap form this controller applies. See [`WindowCapForm`].
+    #[cfg(test)]
+    window_cap_form: WindowCapForm,
 }
 
 impl VardiffState {
@@ -434,6 +464,8 @@ impl VardiffState {
             last_threshold_pct: None,
             #[cfg(test)]
             champion_sparse_boundary: false,
+            #[cfg(test)]
+            window_cap_form: WindowCapForm::Shipped,
         })
     }
 
@@ -444,6 +476,15 @@ impl VardiffState {
     #[cfg(test)]
     pub(crate) fn with_champion_sparse_boundary(mut self) -> Self {
         self.champion_sparse_boundary = true;
+        self
+    }
+
+    /// Test-only: apply a different window-cap form. See [`WindowCapForm`].
+    ///
+    /// Consuming, so a form is chosen once at construction and cannot change mid-trajectory.
+    #[cfg(test)]
+    pub(crate) fn with_window_cap_form(mut self, form: WindowCapForm) -> Self {
+        self.window_cap_form = form;
         self
     }
 
@@ -487,6 +528,70 @@ impl VardiffState {
     #[cfg(test)]
     pub(crate) fn ewma_rate(&self) -> f64 {
         self.rate
+    }
+
+    /// The estimator's own relative spread at a target share rate, as a fraction.
+    ///
+    /// `sigma = sqrt(30 / (r * tau))`, from the EWMA's variance against its effective window of
+    /// `2*tau`. It is the scale every threshold has to be read against: a bar below `sigma` is a bar
+    /// the controller's own wobble clears, so a deviation that crosses it is as likely to be the
+    /// estimator moving as the miner.
+    #[cfg(test)]
+    pub(crate) fn estimator_spread(shares_per_minute: f32) -> f64 {
+        (30.0 / (shares_per_minute as f64 * EWMA_TAU_SECS as f64)).sqrt()
+    }
+
+    /// Window at which this rate's threshold has decayed to the estimator's own spread, in seconds, or
+    /// `None` if it never does.
+    ///
+    /// This is what [`WINDOW_CAP_SECS`] is a single-valued stand-in for, and the reason one constant
+    /// cannot do the job: the answer depends on the rate, through both the bar and `sigma`, and the two
+    /// branches decay at different speeds. Solved rather than searched, once per branch.
+    ///
+    /// `None` above the rate where `sigma` has fallen to [`MIN_THRESHOLD_FRACTION`] -- about 33 shares a
+    /// minute at the shipped `tau`. There the floor alone already holds the bar clear of the spread, so
+    /// there is nothing for a cap to protect and capping would only cost reaction time.
+    #[cfg(test)]
+    pub(crate) fn sigma_matched_window_secs(shares_per_minute: f32) -> Option<u64> {
+        let headroom = Self::estimator_spread(shares_per_minute) - MIN_THRESHOLD_FRACTION;
+        if headroom <= 0.0 || !headroom.is_finite() || shares_per_minute <= 0.0 {
+            return None;
+        }
+        let secs = if shares_per_minute < SPARSE_SPM_SEAM {
+            // `Z/sqrt(lambda) + 0.5/lambda = headroom` is a quadratic in `u = sqrt(lambda)`:
+            // `headroom*u^2 - Z*u - 0.5 = 0`. Only the positive root is a window.
+            let u =
+                (POISSON_Z + (POISSON_Z * POISSON_Z + 2.0 * headroom).sqrt()) / (2.0 * headroom);
+            60.0 * u * u / shares_per_minute as f64
+        } else {
+            // `E*sqrt(r/REF)*60/t = headroom`, directly.
+            60.0 * EVIDENCE_AT_ONE_MINUTE * (shares_per_minute as f64 / REFERENCE_SPM).sqrt()
+                / headroom
+        };
+        secs.is_finite().then(|| secs.round() as u64)
+    }
+
+    /// The window this evaluation may measure over before the anchor is moved, or `None` for uncapped.
+    ///
+    /// Two forms. The shipped one is [`WINDOW_CAP_SECS`] above the seam and uncapped below it. The
+    /// `sigma`-matched one is [`Self::sigma_matched_window_secs`] at every rate, which is the candidate
+    /// that replaces both the constant and the seam gate with one rule -- see `window_cap_form.rs` for
+    /// what it costs.
+    fn window_cap_secs(&self, shares_per_minute: f32) -> Option<u64> {
+        #[cfg(test)]
+        match self.window_cap_form {
+            WindowCapForm::SigmaMatched => {
+                return Self::sigma_matched_window_secs(shares_per_minute)
+            }
+            WindowCapForm::TighterOfBoth => {
+                return (shares_per_minute >= SPARSE_SPM_SEAM).then(|| {
+                    Self::sigma_matched_window_secs(shares_per_minute)
+                        .map_or(WINDOW_CAP_SECS, |matched| matched.min(WINDOW_CAP_SECS))
+                })
+            }
+            WindowCapForm::Shipped => {}
+        }
+        (shares_per_minute >= SPARSE_SPM_SEAM).then_some(WINDOW_CAP_SECS)
     }
 
     /// Decay factor for an interval of `dt_secs`: `e^(−Δt/tau)`.
@@ -952,7 +1057,10 @@ impl Vardiff for VardiffState {
             // from BELOW at a rate where it needs to keep falling -- and a declining channel is left
             // stranded above a bar that has stopped coming down to meet it. Measured on the research
             // branch at +29.9% settled over-difficulty before the seam gate was added.
-            if shares_per_minute >= SPARSE_SPM_SEAM && delta_time >= WINDOW_CAP_SECS {
+            if self
+                .window_cap_secs(shares_per_minute)
+                .is_some_and(|cap| delta_time >= cap)
+            {
                 self.set_timestamp_of_last_update(now);
             }
             return Ok(None);
