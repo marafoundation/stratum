@@ -7,6 +7,7 @@ mod regimes;
 mod relations;
 mod sparse_parity;
 mod target_rate;
+mod tau_split;
 mod trajectory;
 mod window_cap;
 mod window_cap_form;

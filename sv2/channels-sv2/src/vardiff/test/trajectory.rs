@@ -171,6 +171,11 @@ pub(super) enum Arm {
     SigmaMatchedCap,
     /// The shipped boundary, with the window cap never looser than the `sigma`-matched window.
     TighterOfBothCaps,
+    /// The shipped controller, with the estimator's time constant set to this many seconds.
+    ///
+    /// Only the memory changes: the cap stays the constant it is, which is what varying `tau` alone
+    /// would actually do. See `tau_split.rs`.
+    Tau(u64),
 }
 
 /// Drives one trajectory: the miner delivers whatever `delivered` says, the feed samples the share
@@ -194,6 +199,7 @@ pub(super) fn run_trial(
         Arm::ChampionSparse => fresh.with_champion_sparse_boundary(),
         Arm::SigmaMatchedCap => fresh.with_window_cap_form(WindowCapForm::SigmaMatched),
         Arm::TighterOfBothCaps => fresh.with_window_cap_form(WindowCapForm::TighterOfBoth),
+        Arm::Tau(secs) => fresh.with_tau_secs(secs),
     };
 
     let mut believed = START_HASHRATE;

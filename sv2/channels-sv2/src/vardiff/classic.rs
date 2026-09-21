@@ -403,6 +403,12 @@ pub struct VardiffState {
     /// Test-only: which window-cap form this controller applies. See [`WindowCapForm`].
     #[cfg(test)]
     window_cap_form: WindowCapForm,
+    /// Test-only: run the estimator at a different time constant. `None` uses [`EWMA_TAU_SECS`].
+    ///
+    /// Varied by `tau_split.rs`, which asks whether the shipped memory is selected by rates most
+    /// channels do not run at.
+    #[cfg(test)]
+    tau_override_secs: Option<u64>,
 }
 
 impl VardiffState {
@@ -466,6 +472,8 @@ impl VardiffState {
             champion_sparse_boundary: false,
             #[cfg(test)]
             window_cap_form: WindowCapForm::Shipped,
+            #[cfg(test)]
+            tau_override_secs: None,
         })
     }
 
@@ -485,6 +493,15 @@ impl VardiffState {
     #[cfg(test)]
     pub(crate) fn with_window_cap_form(mut self, form: WindowCapForm) -> Self {
         self.window_cap_form = form;
+        self
+    }
+
+    /// Test-only: run the estimator at `tau_secs` instead of [`EWMA_TAU_SECS`].
+    ///
+    /// Consuming, for the same reason: the memory cannot change mid-trajectory.
+    #[cfg(test)]
+    pub(crate) fn with_tau_secs(mut self, tau_secs: u64) -> Self {
+        self.tau_override_secs = Some(tau_secs.max(1));
         self
     }
 
@@ -600,8 +617,21 @@ impl VardiffState {
     /// missed evaluation changes how much the filter forgets by the right amount instead of
     /// silently altering its memory. This is the same reason `tau` is parameterised in seconds
     /// rather than in evaluations.
-    fn ewma_alpha(dt_secs: u64) -> f64 {
-        (-(dt_secs as f64) / (EWMA_TAU_SECS as f64)).exp()
+    fn ewma_alpha(&self, dt_secs: u64) -> f64 {
+        (-(dt_secs as f64) / (self.tau_secs() as f64)).exp()
+    }
+
+    /// The estimator's time constant for this controller, in seconds.
+    ///
+    /// [`EWMA_TAU_SECS`] in every build. A method rather than the constant read directly because the
+    /// memory is the one parameter a test needs to vary: it is what `tau_split.rs` measures, and the
+    /// figure that selects it is measured at rates most channels do not run at.
+    fn tau_secs(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(tau) = self.tau_override_secs {
+            return tau;
+        }
+        EWMA_TAU_SECS
     }
 
     /// Folds the pending share count into the EWMA and returns
@@ -634,7 +664,7 @@ impl VardiffState {
         // An unseeded EWMA takes the first observation whole; blending against a zero prior would
         // start every channel with a fictitious idle period.
         self.rate = if self.rate_seeded {
-            let alpha = Self::ewma_alpha(dt_secs);
+            let alpha = self.ewma_alpha(dt_secs);
             alpha * self.rate + (1.0 - alpha) * observed_spm
         } else {
             observed_spm
