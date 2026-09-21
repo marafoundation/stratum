@@ -32,12 +32,33 @@ fn never_adjusted_pct(drop: f64) -> f64 {
 /// is not meant to be: requiring more evidence to tighten than to loosen leaves it a little below the
 /// truth, and that offset is deliberate. What matters here is that it is nowhere near the do-nothing
 /// reading.
+///
+/// # Why the bound is two-sided, and why 0.25
+///
+/// It was one-sided (`final_error_pct < reference * 0.5`) and that let six of eight readings pass
+/// *trivially*, because a controller that over-corrects settles **negative** and any negative number is
+/// below a positive bound. Over-correction is a real cost — it multiplies the miner's submission load
+/// without changing its payout under difficulty-weighted accounting — so the bound is now on the
+/// magnitude.
+///
+/// `0.25` is measured, not chosen. Across these cells the largest `|settled| / reference` is `0.160`
+/// (40 %/hr at 12 spm), then `0.122` and `0.110`, so `0.25` binds every cell at a margin of 1.6x to
+/// 2.3x. The previous `0.5` was never approached: its tightest margin was 4.5x and six cells did not
+/// test it at all.
+///
+/// A single scalar works here **only because the shallowest cell moved out**. See
+/// `a_disturbance_inside_the_dead_zone_is_a_noise_test_not_a_decline_test` for why, and for what that
+/// cell actually measures.
 #[test]
 fn a_decline_is_detected_at_every_share_rate() {
     /// Cells: hashrate lost per hour, total lost, and the share rates to see it at.
-    const CELLS: [(f64, f64); 4] = [(5.0, 0.20), (2.0, 0.08), (10.0, 0.40), (40.0, 0.50)];
-    /// The most of the do-nothing over-difficulty that may remain.
-    const MAX_REMAINING: f64 = 0.5;
+    ///
+    /// Each disturbance here is larger than the controller's threshold at the settle point, so the
+    /// decline is visible to it as signal. `2 %/hr` losing `8%` is deliberately absent — at `8.34%`
+    /// it is smaller than the bar and cannot be acted on by signal at all.
+    const CELLS: [(f64, f64); 3] = [(5.0, 0.20), (10.0, 0.40), (40.0, 0.50)];
+    /// The most of the do-nothing over-difficulty that may remain, in **magnitude**.
+    const MAX_REMAINING: f64 = 0.25;
     const TRIALS: usize = 40;
 
     for (rate_pct_per_hr, drop) in CELLS {
@@ -64,15 +85,70 @@ fn a_decline_is_detected_at_every_share_rate() {
                 "the decline should be acted on at all -- {report}"
             );
             assert!(
-                trial.final_error_pct < reference * MAX_REMAINING,
-                "and should end well clear of the do-nothing reading -- {report}"
+                trial.final_error_pct.abs() < reference * MAX_REMAINING,
+                "and should end well clear of the do-nothing reading, in either direction -- \
+                 {report}"
             );
             assert!(
-                trial.worst_over_pct < reference + 25.0,
-                "without an excursion far past it on the way, which would mean difficulty moved the \
-                 wrong way -- {report}"
+                trial.worst_over_pct < reference,
+                "without ever being worse than not acting at all, which is the only excursion that \
+                 would mean difficulty moved the wrong way -- {report}"
             );
         }
+    }
+}
+
+/// **A disturbance smaller than the threshold is a noise test, not a decline test.**
+///
+/// `2 %/hr` losing `8%` used to sit in the decline grid. It cannot belong there: the do-nothing
+/// over-difficulty is `8.34%`, and the controller's threshold at the settle point is `18.72%` at
+/// 2 spm and `11.32%` at 12 spm. **The whole disturbance is inside the dead zone**, so a threshold
+/// controller cannot act on it by signal, and the retargets it does make are Poisson fluctuations
+/// crossing the bar rather than the decline being detected.
+///
+/// In the decline grid all three of its assertions were vacuous in different ways: `retargets > 0`
+/// was satisfied by noise, the relative bound by a negative residual, and the excursion bound was
+/// 30 percentage points away.
+///
+/// What it *is* worth measuring is that being unable to see a disturbance does not make the
+/// controller wander. So the assertion is on drift: whatever the noise-driven fires do, the settled
+/// position must stay inside the dead zone that produced them rather than walking out of it.
+#[test]
+fn a_disturbance_inside_the_dead_zone_is_a_noise_test_not_a_decline_test() {
+    const RATE_PCT_PER_HR: f64 = 2.0;
+    const DROP: f64 = 0.08;
+    const TRIALS: usize = 40;
+    /// The threshold at the settle point is 18.72% at 2 spm and 11.32% at 12 spm. Drift must stay
+    /// inside the tighter of the two with headroom: measured worst is -6.61%, so 10% binds at 1.5x.
+    const MAX_DRIFT_PCT: f64 = 10.0;
+
+    let reference = never_adjusted_pct(DROP);
+    for spm in [2.0f32, 12.0] {
+        let trial = measure(
+            &declining(RATE_PCT_PER_HR, DROP),
+            spm,
+            ONE_HOUR,
+            3 * ONE_HOUR,
+            TRIALS,
+        );
+        let report = format!(
+            "{RATE_PCT_PER_HR} %/hr losing {:.0}% at {spm} spm: ends {:+.2}%, worst \
+             over-difficulty {:+.2}%, {} retargets; the whole disturbance is {reference:+.2}%, \
+             which is inside the threshold",
+            DROP * 100.0,
+            trial.final_error_pct,
+            trial.worst_over_pct,
+            trial.retargets
+        );
+        assert!(
+            trial.final_error_pct.abs() < MAX_DRIFT_PCT,
+            "a disturbance the controller cannot see must not make it wander: drift exceeded \
+             {MAX_DRIFT_PCT:.1}% -- {report}"
+        );
+        assert!(
+            trial.worst_over_pct < reference + MAX_DRIFT_PCT,
+            "and it must not overshoot past the disturbance it cannot see -- {report}"
+        );
     }
 }
 
