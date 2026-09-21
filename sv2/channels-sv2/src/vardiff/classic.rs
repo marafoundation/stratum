@@ -180,10 +180,6 @@ const RUN_AT_MAX_STEP_FRACTION: u32 =
 /// and is not attempted here.
 const MAX_STEP_RATIO: f32 = 2.0;
 
-/// Time constant of the EWMA estimator, in seconds.
-///
-/// Old evidence decays on the clock at `e^(−Δt/tau)`, which is what makes the window unable to
-/// entrench: it forgets whether or not the controller ever decides to act.
 /// Longest window the dense threshold is allowed to be measured over, in seconds.
 ///
 /// The dense branch carries an evidence term `EVIDENCE_AT_ONE_MINUTE / window_minutes`, and the
@@ -191,17 +187,39 @@ const MAX_STEP_RATIO: f32 = 2.0;
 /// without bound and that term decays to nothing, leaving the bare `MIN_THRESHOLD_FRACTION`. Bounding
 /// the window bounds the term from below, which bounds the threshold from below.
 ///
-/// Derived rather than chosen, and a trade rather than a free win. The deviation is an AR(1) in log
-/// belief, so distinct up-crossings of a bar `b` go as `exp(-b^2 / 2*sigma^2)` with
-/// `sigma = sqrt(30 / (r * tau))`. At 6.45 shares a minute, `tau = 1200 s` and this cap, the evidence
-/// term cannot fall below 4.64 pp, which lifts the asymptotic bar from 5.00 pp to 9.64 pp and cuts the
-/// long-window rate of unnecessary retargets by about 2.4x.
+/// What it buys, as a lift: at 6.45 shares a minute the evidence term cannot fall below 4.64 pp, so the
+/// asymptotic bar is 9.64 pp rather than the bare 5.00 pp floor. Measured on a stable channel, which is
+/// the case it exists for, that cuts unnecessary retargets 2.5x at 6 shares a minute (2.75 an hour to
+/// 1.08) and 5.1x at 12 (1.67 to 0.33).
 ///
 /// The same lift is the cost. The term is a term *in the threshold*, so holding it up delays every
 /// retarget the threshold gates, including the wanted ones: a real decline on a long-quiet channel
 /// must clear more before it is acted on.
+///
+/// **Where 900 comes from, and what it is not.** The estimator's own spread is
+/// `sigma = sqrt(30 / (r * tau))` -- see [`EWMA_TAU_SECS`] -- so a bar below `sigma` is a bar the
+/// controller's own wobble clears. Requiring the capped bar to sit at `sigma` gives a cap of
+/// `60 * EVIDENCE_AT_ONE_MINUTE * sqrt(r / REFERENCE_SPM) / (sigma - MIN_THRESHOLD_FRACTION)`, which at
+/// the shipped `tau` is 593 s at 6 shares a minute, 1708 s at 12, and diverges as `sigma` falls to the
+/// floor near 33. So a single constant cannot be `sigma`-matched across the band, and **900 is the
+/// matched value at about 8 shares a minute** -- looser than matched below that, tighter than needed
+/// above it. It is a defensible middle rather than a derivation, and the rate-aware form is the open
+/// question. The earlier claim that it was derived cited `tau = 1200 s`, a candidate this branch does
+/// not ship; at `tau = 360` the same AR(1) up-crossing estimate gives about 1.3x rather than the 2.4x
+/// quoted, so the measurement above is what the cap rests on.
 const WINDOW_CAP_SECS: u64 = 900;
 
+/// Time constant of the EWMA estimator, in seconds.
+///
+/// Old evidence decays on the clock at `e^(−Δt/tau)`, which is what makes the window unable to
+/// entrench: it forgets whether or not the controller ever decides to act.
+///
+/// It also sets how precisely anything can be known. The estimator's relative spread is
+/// `sigma = sqrt(30 / (r * tau))` with `r` in shares per minute -- 20.4% at 2, 11.8% at 6, 5.3% at 30 --
+/// so `r * tau` is the only quantity that buys precision, and `tau` is the only half of it this crate
+/// controls. Buying precision with `tau` costs agility, which is why this is a balance and not a
+/// maximum: 360 is the shortest window that stays safe on a sustained decline at the 2-4 share
+/// rates, and those rates are what select it. A channel above the seam would prefer a longer one.
 const EWMA_TAU_SECS: u64 = 360;
 
 use super::{
@@ -277,6 +295,21 @@ pub struct VardiffState {
     /// alongside the implementation, free to drift from it. Read it with
     /// [`VardiffState::last_threshold_pct`].
     last_threshold_pct: Option<f64>,
+    /// Test-only: run the *validated champion's* sparse boundary instead of this one.
+    ///
+    /// Below [`SPARSE_SPM_SEAM`] the configuration the simulation framework selected does not apply
+    /// the tighten multiplier or the persistence discount at all: its boundary switches to a bare,
+    /// symmetric Poisson interval there, and only the dense arm carries the directional machinery.
+    /// This controller applies both at every rate, because it sizes the base by branch and then
+    /// scales it once, after the dispatch. So the two artifacts agree above the seam and disagree
+    /// below it, and the regime where they disagree is the one with the least evidence per decision.
+    ///
+    /// Which of the two should ship is a calibration question, not a correctness one, and it is not
+    /// this flag's to answer. The flag exists so the gap can be *measured* on the trajectory harness
+    /// rather than argued from the formulas, and so that closing it becomes a test change someone has
+    /// to look at. See `test/sparse_parity.rs`.
+    #[cfg(test)]
+    champion_sparse_boundary: bool,
 }
 
 impl VardiffState {
@@ -336,7 +369,19 @@ impl VardiffState {
             rate: 0.0,
             rate_seeded: false,
             last_threshold_pct: None,
+            #[cfg(test)]
+            champion_sparse_boundary: false,
         })
+    }
+
+    /// Test-only: switch the sparse arm to the validated champion's boundary.
+    ///
+    /// See [`VardiffState::champion_sparse_boundary`]. Consuming, so an arm is chosen once at
+    /// construction and cannot be flipped mid-trajectory.
+    #[cfg(test)]
+    pub(crate) fn with_champion_sparse_boundary(mut self) -> Self {
+        self.champion_sparse_boundary = true;
+        self
     }
 
     /// Sets the count of shares since the last update.
@@ -484,11 +529,20 @@ impl VardiffState {
         tightening: bool,
         same_direction_run: u32,
     ) -> f64 {
-        let base = if shares_per_minute < SPARSE_SPM_SEAM {
+        let sparse = shares_per_minute < SPARSE_SPM_SEAM;
+        let base = if sparse {
             Self::sparse_threshold(dt_secs, shares_per_minute)
         } else {
             Self::dense_threshold(dt_secs, shares_per_minute)
         };
+
+        // The champion's sparse arm stops here: a bare, symmetric Poisson interval, with neither the
+        // multiplier nor the discount below the seam. Returning before both is what makes this arm the
+        // champion's rather than an approximation of it.
+        #[cfg(test)]
+        if sparse && self.champion_sparse_boundary {
+            return base;
+        }
 
         // Applied here rather than inside each branch: the direction that needs resisting does not
         // depend on which branch sized the threshold, so it belongs once, after the dispatch.
