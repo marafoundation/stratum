@@ -275,3 +275,86 @@ fn the_caps_sparse_cost_is_wander_free_but_its_crossing_cost_is_not() {
         "and the residue must still be an exact no-op there, wander or not: {tighter} against {shipped}"
     );
 }
+/// **The three re-run conclusions across the wander box, not just at the one measured unit.**
+///
+/// Everything above rests on a single air-cooled unit from a single archive, measured with a sensor the
+/// corpus itself classes as uncharacterized. That is one point, and three conclusions stand on it. This
+/// sweeps a `3x3` box around it -- spread 5% to 20%, timescale 600 s to 6000 s -- and asserts the form of
+/// each conclusion that survives the whole box rather than the form that happens to hold at the point.
+///
+/// **One conclusion is weakened and one is made worse.**
+///
+/// The memory coupling survives as an *ordering*: the sparse cell is worse than the dense one by at least
+/// 3.3 pp in every cell of the box. Its stronger form -- that sparse crosses the 5% gate outright -- holds
+/// in six of nine; at low spread or very slow wander the sparse cells sit just inside, at +4.0 to +5.1. So
+/// "sparse is what binds" is robust and "sparse fails the gate" is condition-dependent, and only the first
+/// should be relied on.
+///
+/// The cap's sparse cost stays absent: the steady-miner `+3.27 pp` is not reproduced anywhere in the box,
+/// whose worst cell is `+2.04`.
+///
+/// And **the shipped controller itself exceeds the gate in three of the nine cells** (+6.67, +6.26,
+/// +5.35). At the measured unit it clears, which is what `the_shipped_margin_at_the_binding_cell_is_thin`
+/// asserts and all that reading claims. Across the plausible box the margin is not thin but absent. That is
+/// a stronger statement of the same concern and it is recorded here rather than in that test, because that
+/// test is about the measured unit and this one is about the box.
+#[test]
+fn the_conclusions_that_survive_the_whole_wander_box() {
+    /// Spreads and timescales bracketing the measured unit.
+    const SPREADS: [f64; 3] = [0.05, 0.1258, 0.20];
+    const TIMESCALES: [u64; 3] = [600, 2269, 6000];
+    /// Least margin by which the sparse cell must be worse than the dense one, in points. The box's
+    /// minimum is 3.27, so this binds at 1.2x.
+    const MIN_SPARSE_DENSE_GAP_PCT: f64 = 2.7;
+    /// Worst sparse-cap cost anywhere in the box. Well below the steady-miner reading it replaces.
+    const MAX_CAP_COST_PCT: f64 = 2.5;
+
+    let mut worst_gap = f64::MAX;
+    let mut worst_cap_cost = f64::MIN;
+    let mut shipped_over_gate = 0usize;
+
+    for sigma in SPREADS {
+        for t_c_secs in TIMESCALES {
+            let w = Some(Wander { sigma, t_c_secs });
+            let sparse = declining_under(2.0, Arm::Tau(720), w).final_error_pct;
+            let dense = declining_under(12.0, Arm::Tau(720), w).final_error_pct;
+            let shipped = declining_under(2.0, Arm::Shipped, w).final_error_pct;
+            let cap_cost = declining_under(2.0, Arm::SigmaMatchedCap, w).final_error_pct - shipped;
+
+            worst_gap = worst_gap.min(sparse - dense);
+            worst_cap_cost = worst_cap_cost.max(cap_cost);
+            if shipped > DECLINE_SAFETY_GATE_PCT {
+                shipped_over_gate += 1;
+            }
+
+            assert!(
+                sparse - dense > MIN_SPARSE_DENSE_GAP_PCT,
+                "at spread {sigma} and timescale {t_c_secs}s a sleepier memory should still hurt 2 spm \
+                 much more than 12 spm: {sparse:+.2}% against {dense:+.2}%, a gap of {:+.2} pp. The \
+                 ordering is the robust form of the coupling claim -- if it fails anywhere in this box, \
+                 the claim does not survive its own uncertainty",
+                sparse - dense
+            );
+            assert!(
+                cap_cost < MAX_CAP_COST_PCT,
+                "and capping the sparse window should not cost what it costs a steady miner: \
+                 {cap_cost:+.2} pp at spread {sigma}, timescale {t_c_secs}s"
+            );
+        }
+    }
+
+    eprintln!(
+        "  [wander box] worst sparse-vs-dense gap {worst_gap:+.2} pp, worst sparse-cap cost \
+         {worst_cap_cost:+.2} pp, shipped over the {DECLINE_SAFETY_GATE_PCT:.0}% gate in \
+         {shipped_over_gate} of 9 cells"
+    );
+
+    // Recorded, not tolerated. The shipped controller failing the gate somewhere in the plausible box is
+    // the most consequential thing this sweep says, and pinning the count makes a change to it legible.
+    assert_eq!(
+        shipped_over_gate, 3,
+        "the shipped controller exceeded the {DECLINE_SAFETY_GATE_PCT:.0}% gate in {shipped_over_gate} \
+         of the 9 box cells, not the 3 recorded. Fewer means the configuration or the box improved and \
+         this should be re-read; more means it got worse. Either way it is not a number to let drift"
+    );
+}
