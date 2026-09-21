@@ -148,6 +148,22 @@ pub(super) struct Trial {
     pub(super) final_threshold_pct: f64,
 }
 
+/// Which controller a trajectory is driven with.
+///
+/// The two agree at or above [`SPARSE_SPM_SEAM`] and differ below it, so on a dense cell this is not a
+/// choice. See `sparse_parity.rs`.
+///
+/// [`SPARSE_SPM_SEAM`]: crate::vardiff::classic
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Arm {
+    /// What this crate ships: the directional multiplier and the persistence discount apply at every
+    /// share rate.
+    Shipped,
+    /// What the simulation framework selected: below the seam, a bare symmetric Poisson interval with
+    /// neither of them.
+    ChampionSparse,
+}
+
 /// Drives one trajectory: the miner delivers whatever `delivered` says, the feed samples the share
 /// count that implies against the difficulty in force, and each returned belief is threaded back in.
 ///
@@ -159,10 +175,15 @@ pub(super) fn run_trial(
     warm_up_secs: u64,
     measured_secs: u64,
     seed: u64,
+    arm: Arm,
 ) -> Trial {
     let clock = Arc::new(MockClock::new(CLOCK_ORIGIN));
-    let mut vardiff = VardiffState::new_with_clock(TEST_MIN_ALLOWED_HASHRATE, clock.clone())
+    let fresh = VardiffState::new_with_clock(TEST_MIN_ALLOWED_HASHRATE, clock.clone())
         .expect("a positive floor and a mock clock construct");
+    let mut vardiff = match arm {
+        Arm::Shipped => fresh,
+        Arm::ChampionSparse => fresh.with_champion_sparse_boundary(),
+    };
 
     let mut believed = START_HASHRATE;
     let mut elapsed = 0;
@@ -230,6 +251,25 @@ pub(super) fn measure(
     measured_secs: u64,
     trials: usize,
 ) -> Trial {
+    measure_arm(
+        delivered,
+        spm,
+        warm_up_secs,
+        measured_secs,
+        trials,
+        Arm::Shipped,
+    )
+}
+
+/// [`measure`], on a named arm. Same seeds, so a pair of readings differs only by the controller.
+pub(super) fn measure_arm(
+    delivered: &impl Fn(u64) -> f64,
+    spm: f32,
+    warm_up_secs: u64,
+    measured_secs: u64,
+    trials: usize,
+    arm: Arm,
+) -> Trial {
     let runs: Vec<Trial> = (0..trials)
         .map(|i| {
             run_trial(
@@ -238,6 +278,7 @@ pub(super) fn measure(
                 warm_up_secs,
                 measured_secs,
                 SEED.wrapping_add(i as u64),
+                arm,
             )
         })
         .collect();
