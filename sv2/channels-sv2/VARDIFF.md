@@ -1,5 +1,60 @@
 # Vardiff: what the controller does, and where it fails
 
+> ## Retraction (supersedes every trajectory figure below)
+>
+> **The share sampler this document's measurements rest on was defective for the whole life of the
+> branch, and two headline findings do not survive its repair.**
+>
+> `run_trial` builds a fresh `XorShift64` per tick from `seed ^ elapsed`. One xorshift round does not
+> carry a low-bit seed change into the top 53 bits `next_f64` reads, so the *first* draw was pinned:
+> across 2880 per-tick seeds it spanned `0.385849` to `0.385864`. Since a Knuth count of zero requires
+> that first draw to fall below `exp(-lambda)`, the consequences were graded by delivered rate:
+>
+> | delivered lambda | what the feed did |
+> |---|---|
+> | `<= 0.952` | **exactly zero arrivals, every tick, forever** |
+> | `1` | mean inflated 4.8%, and `P(0) = 0` against a true 36.8% |
+> | `2` | mean inflated 2.3%, and `P(0) = 0` against a true 13.5% |
+> | `20` | mean inflated 0.2%, `P(0) = 0` |
+>
+> So zero-share ticks were suppressed on *every* live trajectory and the feed collapsed to constant
+> zero below one arrival per tick. **The `pending_shares == 0` branch — the whole silence apparatus —
+> was unreachable on any live channel.** The claim in section 5 that it is "routinely entered, 13.5% of
+> ticks at 2 spm" was arithmetic the harness was structurally incapable of confirming.
+>
+> **Retracted outright:**
+> - **The cold-start lock.** There was no lock. `shares_fed = 0` across 20 seeds over 48 hours, so the
+>   controller was fed nothing; the "48-hour invariance" read as proof of a latch was proof of an empty
+>   input. Repaired, the same cell converges: `-25.21%` at 6 h, `-23.29%` at 48 h, 15 then 48
+>   retargets, 812 then 7101 shares.
+> - **The estimator-memory coupling.** At `tau = 720` the settled errors are now `-4.05%` (2 spm),
+>   `-0.66%` (4) and `-0.72%` (12) — no cell crosses the safety gate, and a sleepier memory is *better*
+>   at every rate. The measured claim was `+5.84% / +4.65% / +0.64%`. "Dense channels run a memory
+>   chosen to keep sparse ones safe" is withdrawn.
+> - **The sparse window cap's second rejection reason.** Capping a sparse window now costs `+0.00 pp`
+>   at every cell. The rate-aware cap's rejection rests solely on the crossing.
+> - The stable-channel churn baselines, and therefore the flapping-churn multiples; the wander box's
+>   "3 of 9 gate failures"; and the "shipped margin is thin" reading.
+>
+> **Survives repair:** the flapping ratchet, essentially unchanged (`-126.71%` against `-123.69%`,
+> median `170.03%` against `168.27%`, 98 retargets either way) — its up-phase sat at `lambda = 2`,
+> where the broken count happened to equal the mean. And the sparse/champion parity gap, which widens
+> to `+13.3` to `+25.2 pp`.
+>
+> **Unaffected:** everything arithmetic — the constant relations and compile-time assertions, the sigma
+> conventions, the seam-versus-cap disagreement, and the 27 mechanism tests, which drive the controller
+> with explicit share counts rather than through the harness.
+>
+> The 14 affected tests are `#[ignore]`d with this reason rather than recalibrated, because a commit
+> whose message says "find a lock" is now a false record and patching numbers under a false headline
+> would leave that in the history. Re-derivation is outstanding; **treat no trajectory figure below as
+> load-bearing until it is done.**
+>
+> Why nothing caught it: the harness's two self-validations both drive a *persistent* generator, a mode
+> no trajectory uses, so they validated the wrong configuration. And mutation testing proves an
+> assertion binds against a code change; it is orthogonal to whether the input exercises the code at
+> all. Every mutation on this branch was compared against the same dead feed.
+
 A reference for `src/vardiff/classic.rs`. Every number here is produced by a test in
 `src/vardiff/test/`, named inline. Run them with:
 
