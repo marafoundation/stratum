@@ -21,7 +21,11 @@ use super::{
 };
 use crate::{
     target::hash_rate_to_target,
-    vardiff::{classic::VardiffState, clock::MockClock, Vardiff},
+    vardiff::{
+        classic::{VardiffState, WINDOW_CAP_SECS},
+        clock::MockClock,
+        Vardiff,
+    },
 };
 
 const ONE_HOUR: u64 = 3600;
@@ -212,15 +216,31 @@ fn a_silent_channel_rests_at_the_displacement_bound() {
 ///
 /// The retarget count is what matters more, because each one is a message and a discontinuity for the
 /// miner. A controller that scored well on the decline by reacting to everything would fail here.
+///
+/// **This is the test that prices what the window cap is for.** On a channel that is not changing,
+/// every retarget is a move made on noise, and bounding those is the cap's entire justification. So
+/// the churn budget is stated in the cap's own units -- one move per cap window -- which makes the
+/// bound move if the cap does.
+///
+/// The offset is bounded twice, because either bound alone is satisfiable without the property
+/// holding. As a fraction of the threshold in force, it says the controller rests inside the dead
+/// zone its own evidence bought; a wide threshold would satisfy that with an arbitrarily large
+/// offset, so an absolute ceiling says the dead zone is not itself unbounded. Neither is derivable
+/// from the other, and the absolute one binds at the sparsest rate while the relative one binds in
+/// the middle of the range.
 #[test]
-#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn a_stable_channel_is_left_largely_alone() {
-    /// Difficulty changes an hour.
-    const MAX_RETARGETS_PER_HOUR: f64 = 4.0;
-    /// The standing offset, in percent. An error of this size is a share-rate error of the same size,
-    /// which share accounting does not care about, because a share is credited at the difficulty it
-    /// was found at.
-    const MAX_MEDIAN_OFFSET_PCT: f64 = 12.0;
+    /// Difficulty changes an hour, as one move per window cap: on a channel that is not changing the
+    /// bar has had a full cap window to decay between moves. Measured worst 2.75/h at 6 spm.
+    const MAX_RETARGETS_PER_HOUR: f64 = 3600.0 / WINDOW_CAP_SECS as f64;
+    /// The standing offset, as a fraction of the threshold that produced it. Measured worst 0.325 at
+    /// 6 spm.
+    const MAX_OFFSET_OVER_THRESHOLD: f64 = 0.5;
+    /// And in percent, because the ratio above is scaled by a threshold that is itself wide at sparse
+    /// rates. An error of this size is a share-rate error of the same size, which share accounting
+    /// does not care about, because a share is credited at the difficulty it was found at. Measured
+    /// worst 20.45% at 2 spm, where the threshold in force is 83%.
+    const MAX_MEDIAN_OFFSET_PCT: f64 = 25.0;
     const MEASURED_HOURS: u64 = 12;
     const TRIALS: usize = 9;
 
@@ -233,17 +253,23 @@ fn a_stable_channel_is_left_largely_alone() {
             TRIALS,
         );
         let per_hour = trial.retargets as f64 / MEASURED_HOURS as f64;
+        let offset_over_threshold = trial.median_error_pct / trial.final_threshold_pct;
         let report = format!(
             "at {spm} spm a stable channel saw {per_hour:.2} retargets an hour, sitting {:.2}% out \
-             at the median and {:.2}% at the 95th percentile",
-            trial.median_error_pct, trial.p95_error_pct
+             at the median and {:.2}% at the 95th percentile, against a threshold in force of \
+             {:.2}% ({offset_over_threshold:.3} of it)",
+            trial.median_error_pct, trial.p95_error_pct, trial.final_threshold_pct
         );
 
-        eprintln!("  [churn] {report}");
         assert!(
-            per_hour <= 1e9, // probe: report rather than gate
+            per_hour <= MAX_RETARGETS_PER_HOUR,
             "a stable channel should not be retargeted more than \
              {MAX_RETARGETS_PER_HOUR} times an hour -- {report}"
+        );
+        assert!(
+            offset_over_threshold <= MAX_OFFSET_OVER_THRESHOLD,
+            "and should rest well inside the threshold that produced it, within \
+             {MAX_OFFSET_OVER_THRESHOLD} of it -- {report}"
         );
         assert!(
             trial.median_error_pct <= MAX_MEDIAN_OFFSET_PCT,

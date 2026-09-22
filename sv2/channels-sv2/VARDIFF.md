@@ -50,6 +50,12 @@
 > would leave that in the history. Re-derivation is outstanding; **treat no trajectory figure below as
 > load-bearing until it is done.**
 >
+> **1 of the 14 re-derived, 13 outstanding.** `test::regimes::a_stable_channel_is_left_largely_alone` is
+> re-enabled: churn budget restated as `3600 / WINDOW_CAP_SECS`, the standing offset bounded both as a
+> fraction of the threshold in force and absolutely, all three verified to bind by mutation. Its absolute
+> offset bound moved `12% -> 25%` because at 2 spm the repaired feed settles at `20.45%` against a
+> threshold of `83%` — the old figure was measured where the broken feed delivered nothing at all.
+>
 > Why nothing caught it: the harness's two self-validations both drive a *persistent* generator, a mode
 > no trajectory uses, so they validated the wrong configuration. And mutation testing proves an
 > assertion binds against a code change; it is orthogonal to whether the input exercises the code at
