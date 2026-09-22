@@ -478,7 +478,8 @@ fn round_down_pow2(difficulty: f64) -> f64 {
     2f64.powi(difficulty.log2().floor() as i32)
 }
 
-/// **Reproduces the 17.9-hour stall measured on hardware 2026-09-22, and prices the candidate fix.**
+/// **The composed path reaches the right octave — the property whose absence stalled a channel for
+/// 17.9 hours on hardware.**
 ///
 /// No harness in this crate quantises the target — every one calls `hash_rate_to_target` directly and
 /// feeds the controller a continuous difficulty. The power-of-two round-down lives in the translator,
@@ -505,9 +506,16 @@ fn round_down_pow2(difficulty: f64) -> f64 {
 ///    permanent one.
 ///
 /// Classic, on the identical path, crosses the octave on its first retarget because it retargets in
-/// full. The stall is a property of this composition, not of quantised actuators.
+/// full. The stall was a property of this composition, not of quantised actuators.
+///
+/// # What this asserted before the fix, kept because the numbers are the evidence
+///
+/// Until the window cap was exempted on the tighten direction, this test asserted the **stall**: belief
+/// 128.52 TH/s against a boundary of 140.74, serving 32,768, realizing 68.2/min against a 30/min
+/// target — matching hardware's 128.65 TH/s to 0.1%. That is what the fix changed, and the assertion was
+/// inverted rather than deleted so the before-figures stay attached to the test that measured them.
 #[test]
-fn the_quantised_path_stalls_below_an_octave_boundary() {
+fn the_quantised_path_crosses_the_octave_boundary() {
     /// Where `first_target` puts the opening belief on the rig: 80 TH/s.
     const OPENING_BELIEF: f32 = 80e12;
     /// What the miner actually runs at.
@@ -557,22 +565,24 @@ fn the_quantised_path_stalls_below_an_octave_boundary() {
         boundary / 1e12
     );
 
-    // The stall, asserted as the hardware measured it.
+    // Asserted the other way round since the fix. Deleting the old direction would have lost the
+    // measurement; inverting it keeps the test pointed at the same property.
     assert!(
-        (believed as f64) < boundary,
-        "the belief crossed the octave boundary, so this no longer reproduces the stall measured on \
-         hardware 2026-09-22 -- if a fix landed, move this assertion rather than deleting it: {report}"
+        (believed as f64) > boundary,
+        "the belief failed to cross the octave boundary, which is the 17.9-hour hardware stall \
+         returning -- before the window cap was exempted on the tighten direction this read 128.52 \
+         TH/s against a 140.74 boundary: {report}"
     );
     assert!(
-        realized > 1.5 * SPM as f64,
-        "the stall must leave the miner materially over-delivering or it is not the defect: {report}"
+        realized < 1.5 * SPM as f64,
+        "and the miner must not be left materially over-delivering; the stall left it at 2.27x: \
+         {report}"
     );
-    // And it is a fixed point, not a slow approach: the served difficulty stops changing.
+    // Still a fixed point, but now the right one: it settles and stays.
     let last_quarter = &served_history[served_history.len() * 3 / 4..];
     assert!(
         last_quarter.windows(2).all(|w| w[0] == w[1]),
-        "the served difficulty was still moving in the final quarter, so this is lag rather than a \
-         fixed point: {report}"
+        "the served difficulty was still moving in the final quarter, so it has not settled: {report}"
     );
     eprintln!("  [stall] {report}");
 }

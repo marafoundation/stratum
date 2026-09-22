@@ -1141,9 +1141,26 @@ impl Vardiff for VardiffState {
             // from BELOW at a rate where it needs to keep falling -- and a declining channel is left
             // stranded above a bar that has stopped coming down to meet it. Measured on the research
             // branch at +29.9% settled over-difficulty before the seam gate was added.
-            if self
-                .window_cap_secs(shares_per_minute)
-                .is_some_and(|cap| delta_time >= cap)
+            // NOT on the tighten direction, and this is the narrower half of the cap's story.
+            //
+            // The cap's justification is a false-fire budget, and a false fire is a move made on noise.
+            // Holding the bar up is how that budget is met. But the bar the cap holds up is already
+            // multiplied by `TIGHTEN_MULTIPLIER` on the tighten side, so on that side the cap defends a
+            // floor eight times higher than the one it was derived against -- and a deviation smaller
+            // than that floor can never close, however long it persists.
+            //
+            // Measured: a channel whose belief sat 9.4% below a power-of-two boundary held there for
+            // 17.9 hours on hardware, serving one octave low and delivering 2.27x its target share
+            // rate, with a 25.7% deviation against a 64% bar that the cap prevented from decaying.
+            // Classic, on the identical path, crossed on its first retarget because it retargets in
+            // full. Reproduced in `test::regimes::the_quantised_path_crosses_the_octave_boundary`.
+            //
+            // The loosening side keeps the cap unchanged: that is the direction the budget was derived
+            // for, and the direction on which a decaying bar strands a declining channel.
+            if !tightening
+                && self
+                    .window_cap_secs(shares_per_minute)
+                    .is_some_and(|cap| delta_time >= cap)
             {
                 self.set_timestamp_of_last_update(now);
             }
