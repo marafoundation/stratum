@@ -98,6 +98,16 @@ const KNUTH_LIMIT: f64 = 30.0;
 /// large only arises from a degenerate belief, and establishing that must not cost more than a tick.
 const MAX_SAMPLED_SHARES: u32 = 1_000_000;
 
+/// One tick's delivered share count, seeded the way a trial seeds it.
+///
+/// Extracted so `the_delivered_feed_is_poisson` exercises the path `run_trial` uses rather than a copy
+/// of it. A statistical guard on a reimplementation of the feed would not have caught the defect this
+/// one exists for, because the defect was in how the generator is *seeded* per tick, not in the
+/// sampling arithmetic.
+pub(super) fn sample_tick(seed: u64, elapsed: u64, lambda: f64) -> u32 {
+    sample_poisson(&mut XorShift64::new(seed.wrapping_add(elapsed)), lambda)
+}
+
 pub(super) fn sample_poisson(rng: &mut XorShift64, lambda: f64) -> u32 {
     // A non-finite mean would reach the normal branch and produce a meaningless count; a zero one has
     // no shares to draw. Both arise from a degenerate belief, which is behaviour under test.
@@ -336,7 +346,7 @@ pub(super) fn run_trial(
                 None => 1.0,
             };
         let lambda = (delivered_now / believed as f64) * spm as f64 * (TICK_SECS as f64 / 60.0);
-        let shares = sample_poisson(&mut XorShift64::new(seed.wrapping_add(elapsed)), lambda);
+        let shares = sample_tick(seed, elapsed, lambda);
         for _ in 0..shares {
             vardiff.increment_shares_since_last_update();
         }
@@ -629,6 +639,70 @@ fn the_generator_mixes_consecutive_seeds() {
         (arrivals as f64 / expected_arrivals - 1.0).abs() < 0.3,
         "a channel expecting {expected_arrivals:.0} arrivals over {TICKS} ticks received {arrivals}.          Zero here is the defect that produced a spurious 'lock' finding: the controller was not          locking, it was being fed nothing"
     );
+}
+
+/// **The counts a trajectory is actually fed must be Poisson: mean, variance, and zero fraction.**
+///
+/// The guard this harness most needed and did not have. Every other check here tests a *component* --
+/// the generator's spread, the sampler's mean -- and the defect that invalidated the branch's whole
+/// empirical tier slipped between them: the sampler reproduced its mean to within a few percent while
+/// making the zero-count outcome **impossible** and, below one arrival a tick, returning nothing at all.
+///
+/// So this asserts the three moments that together pin a Poisson feed, on the code path a trial runs:
+///
+/// - **mean**, which the old checks covered;
+/// - **variance equal to the mean**, which nothing covered, and which is what "there is sampling noise
+///   at all" means;
+/// - **the zero fraction**, `e^-lambda`, which nothing covered and which the defect drove to zero
+///   everywhere. It is the load-bearing one: a zero-share tick is the *input* to the silence apparatus,
+///   so suppressing it made an entire branch of the controller unreachable while every test still
+///   passed.
+///
+/// Model-free by construction. It makes no claim about what the controller does with the feed, so it
+/// cannot be confounded by a controller change -- which is what lets it stand as a permanent instrument
+/// check rather than a calibration that drifts.
+#[test]
+fn the_delivered_feed_is_poisson() {
+    /// Enough draws that the zero fraction is resolvable at the rates that matter.
+    const DRAWS: u64 = 40_000;
+
+    for lambda in [0.02f64, 0.2, 1.0, 2.0, 12.0, 29.0, 31.0, 60.0] {
+        let counts: Vec<u32> = (1..=DRAWS)
+            .map(|k| sample_tick(SEED ^ lambda.to_bits(), 60 * k, lambda))
+            .collect();
+        let n = counts.len() as f64;
+        let mean = counts.iter().map(|&c| c as f64).sum::<f64>() / n;
+        let variance = counts
+            .iter()
+            .map(|&c| (c as f64 - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        let zero_fraction = counts.iter().filter(|&&c| c == 0).count() as f64 / n;
+        let expected_zero = (-lambda).exp();
+
+        eprintln!(
+            "  [feed] lambda {lambda:>5}: mean {mean:.4} var/mean {:.3} P(0) {zero_fraction:.4} (expected {expected_zero:.4})",
+            variance / mean
+        );
+
+        assert!(
+            (mean / lambda - 1.0).abs() < 0.05,
+            "lambda {lambda} delivered a mean of {mean:.4}, off by more than 5%"
+        );
+        assert!(
+            (variance / mean - 1.0).abs() < 0.15,
+            "lambda {lambda} delivered variance/mean of {:.3}, not the 1.0 a Poisson count has. Below              1 the feed is under-dispersed -- the defect this guard exists for made it 0 at small              lambda, so the controller saw no sampling noise to respond to",
+            variance / mean
+        );
+        // Absolute tolerance, because at large lambda the expected fraction is ~0 and a relative bound
+        // would be meaningless.
+        assert!(
+            (zero_fraction - expected_zero).abs() < 0.02,
+            "lambda {lambda} delivered zero shares on {:.2}% of ticks against the {:.2}% a Poisson              feed gives. A zero-share tick is the input to the silence apparatus, so getting this              wrong makes a whole branch of the controller unreachable without failing anything else",
+            zero_fraction * 100.0,
+            expected_zero * 100.0
+        );
+    }
 }
 
 /// Both sampling branches must reproduce their mean, or a trajectory that crosses `KNUTH_LIMIT`
