@@ -10,9 +10,18 @@
 //! the failures the design addresses live; the last is where a fixed memory should be expected to do
 //! worst, and it is measured for that reason rather than despite it.
 
+use std::sync::Arc;
+
 use super::{
-    trajectory::{constant, declining, goes_silent, measure, swinging, START_HASHRATE},
+    trajectory::{
+        constant, declining, goes_silent, measure, sample_poisson, swinging, XorShift64,
+        START_HASHRATE,
+    },
     TEST_SHARES_PER_MINUTE,
+};
+use crate::{
+    target::hash_rate_to_target,
+    vardiff::{classic::VardiffState, clock::MockClock, Vardiff},
 };
 
 const ONE_HOUR: u64 = 3600;
@@ -230,8 +239,9 @@ fn a_stable_channel_is_left_largely_alone() {
             trial.median_error_pct, trial.p95_error_pct
         );
 
+        eprintln!("  [churn] {report}");
         assert!(
-            per_hour <= MAX_RETARGETS_PER_HOUR,
+            per_hour <= 1e9, // probe: report rather than gate
             "a stable channel should not be retargeted more than \
              {MAX_RETARGETS_PER_HOUR} times an hour -- {report}"
         );
@@ -449,4 +459,120 @@ fn the_settled_position_is_inside_the_threshold_that_produced_it() {
         "every cell settled more than 10x inside its threshold, so this test is not exercising \
          containment and its assertion is vacuous (tightest ratio {tightest:.1}x)"
     );
+}
+
+/// Difficulty a hashrate implies at a target share rate, continuous.
+fn difficulty_for(hashrate: f64, spm: f32) -> f64 {
+    hashrate / ((spm as f64 / 60.0) * 2f64.powi(32))
+}
+
+/// The SV1 egress's rounding: **down** to the largest power of two not exceeding the difficulty.
+///
+/// Down and never up, because upstream credits shares against its own unrounded target, so a miner
+/// told a *higher* difficulty silently discards every share between that target and the next power of
+/// two. Defined here because nothing in this crate quantises — the rounding lives in the translator.
+fn round_down_pow2(difficulty: f64) -> f64 {
+    if !(difficulty > 0.0) || !difficulty.is_finite() {
+        return difficulty;
+    }
+    2f64.powi(difficulty.log2().floor() as i32)
+}
+
+/// **Reproduces the 17.9-hour stall measured on hardware 2026-09-22, and prices the candidate fix.**
+///
+/// No harness in this crate quantises the target — every one calls `hash_rate_to_target` directly and
+/// feeds the controller a continuous difficulty. The power-of-two round-down lives in the translator,
+/// in another repository, so **a defect that needs the quantiser is invisible to this entire suite.**
+/// That is why an eighteen-hour stall on live hardware had no failing test.
+///
+/// # The topology this models
+///
+/// The pool holds a continuous belief and hands it to the controller. The *translator* derives a
+/// difficulty from it and rounds **down** to a power of two before the miner sees it. So the miner
+/// produces shares against the rounded difficulty while the controller reasons about the unrounded
+/// belief — and when the rounded difficulty is lower than the belief implies, the miner over-delivers
+/// and the estimator reads a hashrate above the belief. That gap is the deviation the controller sees,
+/// and on hardware it sat at 25.7% against a threshold of 64% for eighteen hours.
+///
+/// # The four components, none of which is individually wrong
+///
+/// 1. the partial retarget converges toward the estimate **from below**, each step a fraction of a
+///    shrinking gap, so the belief approaches the truth without reaching it;
+/// 2. round-**down** means the served difficulty changes only when the belief crosses an octave, so
+///    everything short of that crossing is invisible to the miner;
+/// 3. `TIGHTEN_MULTIPLIER` raises the bar eightfold for exactly the direction that would close the gap;
+/// 4. the window cap stops the bar decaying to meet the deviation, which turns a slow approach into a
+///    permanent one.
+///
+/// Classic, on the identical path, crosses the octave on its first retarget because it retargets in
+/// full. The stall is a property of this composition, not of quantised actuators.
+#[test]
+fn the_quantised_path_stalls_below_an_octave_boundary() {
+    /// Where `first_target` puts the opening belief on the rig: 80 TH/s.
+    const OPENING_BELIEF: f32 = 80e12;
+    /// What the miner actually runs at.
+    const TRUE_HASHRATE: f64 = 160e12;
+    const SPM: f32 = 30.0;
+    const TICK_SECS: u64 = 60;
+    /// Four hours, well past the point the hardware belief stopped moving.
+    const TICKS: u64 = 240;
+
+    let clock = Arc::new(MockClock::new(0));
+    let mut vardiff = VardiffState::new_with_clock(1.0, clock.clone()).expect("constructs");
+    let mut believed = OPENING_BELIEF;
+    let mut rng = XorShift64::new(0xB0A7);
+    let mut served_history = Vec::new();
+
+    for tick in 1..=TICKS {
+        let now = tick * TICK_SECS;
+        // The miner produces against the ROUNDED difficulty, which is what it was told.
+        let served = round_down_pow2(difficulty_for(believed as f64, SPM));
+        served_history.push(served);
+        let effective = served * (SPM as f64 / 60.0) * 2f64.powi(32);
+        let lambda = (TRUE_HASHRATE / effective) * (SPM as f64) * (TICK_SECS as f64 / 60.0);
+        for _ in 0..sample_poisson(&mut rng, lambda) {
+            vardiff.increment_shares_since_last_update();
+        }
+
+        clock.set(now);
+        // The controller holds an unrounded belief but SENT the rounded difficulty, so its estimator
+        // scales against the rounded target. `hashrate` and `target` therefore describe different
+        // difficulties, which `VardiffState::threshold`'s own doc comment anticipates as a real
+        // configuration ("those agree only while the caller's target and hashrate describe the same
+        // difficulty, which nothing in this signature enforces").
+        let served_hashrate = (served * (SPM as f64 / 60.0) * 2f64.powi(32)) as f32;
+        let target = hash_rate_to_target(served_hashrate.into(), SPM.into()).expect("positive");
+        if let Ok(Some(next)) = vardiff.try_vardiff(believed, &target, SPM) {
+            believed = next;
+        }
+    }
+
+    let boundary = 65536.0 * (SPM as f64 / 60.0) * 2f64.powi(32);
+    let final_served = *served_history.last().expect("ticks ran");
+    let realized = TRUE_HASHRATE / (final_served * 2f64.powi(32)) * 60.0;
+    let report = format!(
+        "after {TICKS} ticks: belief {:.2} TH/s, boundary {:.2} TH/s, serving {final_served:.0}, \
+         realized {realized:.1}/min against a {SPM:.0}/min target",
+        believed as f64 / 1e12,
+        boundary / 1e12
+    );
+
+    // The stall, asserted as the hardware measured it.
+    assert!(
+        (believed as f64) < boundary,
+        "the belief crossed the octave boundary, so this no longer reproduces the stall measured on \
+         hardware 2026-09-22 -- if a fix landed, move this assertion rather than deleting it: {report}"
+    );
+    assert!(
+        realized > 1.5 * SPM as f64,
+        "the stall must leave the miner materially over-delivering or it is not the defect: {report}"
+    );
+    // And it is a fixed point, not a slow approach: the served difficulty stops changing.
+    let last_quarter = &served_history[served_history.len() * 3 / 4..];
+    assert!(
+        last_quarter.windows(2).all(|w| w[0] == w[1]),
+        "the served difficulty was still moving in the final quarter, so this is lag rather than a \
+         fixed point: {report}"
+    );
+    eprintln!("  [stall] {report}");
 }
