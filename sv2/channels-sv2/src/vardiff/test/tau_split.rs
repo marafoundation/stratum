@@ -57,6 +57,7 @@ fn stable_trial(spm: f32, arm: Arm) -> Trial {
 /// Both halves are asserted, because either alone proves nothing: sparse failing says only that the gate
 /// binds somewhere, and dense passing says only that it does not bind there.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn a_sleepier_memory_is_refused_by_the_sparse_cells_and_only_by_them() {
     let sparse = declining_trial(2.0, SLEEPIER);
     let dense = declining_trial(12.0, SLEEPIER);

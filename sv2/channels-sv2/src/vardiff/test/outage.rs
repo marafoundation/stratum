@@ -149,6 +149,7 @@ fn the_displacement_bound_is_not_what_binds_on_a_flapping_channel() {
 /// flapping multiple is 33x and 55x where the ceiling would imply 2x to 4.5x. Comparing against an SLA
 /// ceiling reads as though the churn were near-normal; it is nowhere near normal.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn a_flapping_miner_costs_several_times_the_intended_load() {
     /// The worst cycle in the sweep below.
     const PERIOD_SECS: u64 = 1800;

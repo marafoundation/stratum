@@ -50,6 +50,7 @@ fn never_adjusted_pct(drop: f64) -> f64 {
 /// `a_disturbance_inside_the_dead_zone_is_a_noise_test_not_a_decline_test` for why, and for what that
 /// cell actually measures.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn a_decline_is_detected_at_every_share_rate() {
     /// Cells: hashrate lost per hour, total lost, and the share rates to see it at.
     ///
@@ -114,6 +115,7 @@ fn a_decline_is_detected_at_every_share_rate() {
 /// controller wander. So the assertion is on drift: whatever the noise-driven fires do, the settled
 /// position must stay inside the dead zone that produced them rather than walking out of it.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn a_disturbance_inside_the_dead_zone_is_a_noise_test_not_a_decline_test() {
     const RATE_PCT_PER_HR: f64 = 2.0;
     const DROP: f64 = 0.08;
@@ -202,6 +204,7 @@ fn a_silent_channel_rests_at_the_displacement_bound() {
 /// The retarget count is what matters more, because each one is a message and a discontinuity for the
 /// miner. A controller that scored well on the decline by reacting to everything would fail here.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn a_stable_channel_is_left_largely_alone() {
     /// Difficulty changes an hour.
     const MAX_RETARGETS_PER_HOUR: f64 = 4.0;
@@ -314,6 +317,7 @@ fn a_miner_swinging_near_the_memory_is_averaged_rather_than_followed() {
 /// controller actually achieves, so the test fails on a *regression* rather than
 /// encoding a target it may or may not clear.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn the_absolute_settled_error_is_held_not_merely_the_relative_one() {
     /// Cells shared with `a_decline_is_detected_at_every_share_rate`.
     const CELLS: [(f64, f64); 4] = [(5.0, 0.20), (2.0, 0.08), (10.0, 0.40), (40.0, 0.50)];

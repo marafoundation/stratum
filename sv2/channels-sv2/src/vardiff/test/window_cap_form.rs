@@ -131,6 +131,7 @@ fn the_matched_rule_helps_below_the_crossing_and_hurts_above_it() {
 /// The reading below is still worth keeping, because it is the one that isolates the cap's own effect from
 /// the disturbance; it is just not evidence about a deployment.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn capping_the_sparse_window_costs_a_slow_decline_without_wander() {
     const TRIALS: usize = 40;
     /// What the slow cell pays, measured. Held as a range: a cost that has vanished means the sparse

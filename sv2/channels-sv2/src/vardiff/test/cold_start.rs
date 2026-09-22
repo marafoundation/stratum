@@ -52,6 +52,7 @@ fn from_declaration(factor: f64, spm: f32, hours: u64) -> Trial {
 /// apart. The 9x bound is a bounded-regret policy against a returning miner's share flood; this is the
 /// other side of that bet, and it is unbounded in duration.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn an_over_declared_sparse_channel_locks_at_the_displacement_bound() {
     let short = from_declaration(0.01, 2.0, 6);
     let long = from_declaration(0.01, 2.0, 48);
@@ -142,6 +143,7 @@ fn the_same_over_declaration_recovers_at_a_dense_rate() {
 /// What matters is that the climb is geometric -- a 100x error should cost a handful of moves, not a
 /// hundred.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn an_under_declared_channel_climbs_geometrically_at_every_rate() {
     /// A 100x error is 4.6 e-folds; a partial step closing a fraction of the remaining gap converges
     /// geometrically, so this should be single digits at any rate.

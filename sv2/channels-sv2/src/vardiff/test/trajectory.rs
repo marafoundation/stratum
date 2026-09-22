@@ -46,21 +46,35 @@ const WANDER_SEED_SALT: u64 = 0x_4AD3_0000_0000_0001;
 pub(super) struct XorShift64(u64);
 
 impl XorShift64 {
-    /// Seeds the generator, substituting for the one value it cannot use.
+    /// Seeds the generator, avalanching the seed first.
     ///
-    /// Zero is a fixed point of this recurrence: a generator started there stays there and returns
-    /// the same value forever, which `sample_poisson` reads as no arrivals at any rate. A trial fed
-    /// by it would report a channel that never submits whatever the difficulty in force.
+    /// **The avalanche is load-bearing and its absence was a silent, total defect.** This generator is
+    /// constructed *per tick* from `seed ^ elapsed`, so consecutive constructions differ only in low
+    /// bits — and one xorshift round does not carry a low-bit change into the top 53 bits that
+    /// [`Self::next_f64`] reads. Without mixing, the first output across 2880 consecutive per-tick
+    /// seeds spanned `0.385849` to `0.385864`: a constant to five decimal places.
     ///
-    /// Only that one value is replaced. Forcing a bit instead -- `seed | 1` -- would map every even
-    /// seed onto its odd neighbour, and trials are numbered with consecutive seeds, so each trial
-    /// would duplicate the one beside it and every cell would have half the sample size it reports.
+    /// A constant uniform draw makes `sample_poisson` **deterministic**, and in the direction that
+    /// hides itself. Knuth's loop then multiplies by the same factor each time, so the count is a
+    /// fixed function of the mean: a channel expecting two shares a tick received exactly two, every
+    /// tick, with **zero sampling noise**; one expecting fewer than 0.95 received exactly zero,
+    /// forever. Every measurement over a trajectory therefore ran against a deterministic share feed,
+    /// and rare-arrival cells were fed nothing at all.
+    ///
+    /// SplitMix64's finalizer fixes it — a standard avalanche with no dependency — restoring 57
+    /// arrivals where 57 are expected at `lambda = 0.02`, uniform to `chi2 = 6.0` on 9 degrees of
+    /// freedom. Pinned by `the_generator_mixes_consecutive_seeds`, which tests the *per-tick* mode the
+    /// harness actually uses. The pre-existing sampler tests validated a persistent generator, which
+    /// is a mode no trajectory runs.
+    ///
+    /// Zero needs no special case once the seed is avalanched: the finalizer maps it to a nonzero
+    /// state, so the recurrence's one fixed point is unreachable from any seed.
     pub(super) fn new(seed: u64) -> Self {
-        Self(if seed == 0 {
-            0x9E37_79B9_7F4A_7C15
-        } else {
-            seed
-        })
+        // SplitMix64 finalizer.
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        Self(z ^ (z >> 31))
     }
 
     fn next_f64(&mut self) -> f64 {
@@ -565,8 +579,63 @@ fn the_share_feed_responds_to_the_difficulty_in_force() {
     );
 }
 
+/// **The generator must decorrelate consecutive seeds, because that is how the harness uses it.**
+///
+/// `run_trial` constructs a fresh generator per tick from `seed ^ elapsed`, so the only mode that
+/// matters is the *first* output from nearby seeds. The sampler tests below use a persistent generator
+/// and therefore could not see -- and did not see -- that one xorshift round left that first output
+/// constant to five decimal places, which made every trajectory's share feed deterministic and starved
+/// rare-arrival cells of shares entirely.
+///
+/// This tests the mode in use: 2880 per-tick seeds, as a 48-hour run produces.
+#[test]
+fn the_generator_mixes_consecutive_seeds() {
+    const TICKS: u64 = 2880;
+    let firsts: Vec<f64> = (1..=TICKS)
+        .map(|k| XorShift64::new(SEED.wrapping_add(60 * k)).next_f64())
+        .collect();
+
+    let (lo, hi) = firsts
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+    assert!(
+        hi - lo > 0.9,
+        "the first output across per-tick seeds spanned only {:.6} ({lo:.6} to {hi:.6}). A narrow span          makes sample_poisson deterministic: Knuth's loop multiplies by the same factor every time, so          the count becomes a fixed function of the mean and the feed carries no sampling noise at all",
+        hi - lo
+    );
+
+    // Uniformity, because a wide span is not the same as a good distribution.
+    let mut buckets = [0usize; 10];
+    for &v in &firsts {
+        buckets[((v * 10.0) as usize).min(9)] += 1;
+    }
+    let expected = TICKS as f64 / 10.0;
+    let chi2: f64 = buckets
+        .iter()
+        .map(|&c| (c as f64 - expected).powi(2) / expected)
+        .sum();
+    assert!(
+        chi2 < 16.9,
+        "per-tick first outputs are not uniform: chi2 {chi2:.1} over 10 buckets {buckets:?}, against          16.9 for 9 degrees of freedom at p=0.05"
+    );
+
+    // And the consequence that actually bit: a rare-arrival cell must receive arrivals.
+    let lambda = 0.02;
+    let arrivals: u32 = (1..=TICKS)
+        .map(|k| sample_poisson(&mut XorShift64::new(SEED.wrapping_add(60 * k)), lambda))
+        .sum();
+    let expected_arrivals = lambda * TICKS as f64;
+    assert!(
+        (arrivals as f64 / expected_arrivals - 1.0).abs() < 0.3,
+        "a channel expecting {expected_arrivals:.0} arrivals over {TICKS} ticks received {arrivals}.          Zero here is the defect that produced a spurious 'lock' finding: the controller was not          locking, it was being fed nothing"
+    );
+}
+
 /// Both sampling branches must reproduce their mean, or a trajectory that crosses `KNUTH_LIMIT`
 /// silently changes its share statistics partway through.
+///
+/// **Note the mode.** This drives a persistent generator, which no trajectory does, so it cannot
+/// detect a seeding defect. `the_generator_mixes_consecutive_seeds` covers the mode in use; keep both.
 #[test]
 fn both_poisson_branches_reproduce_their_mean() {
     for lambda in [1.0f64, 12.0, KNUTH_LIMIT - 1.0, KNUTH_LIMIT + 1.0, 200.0] {

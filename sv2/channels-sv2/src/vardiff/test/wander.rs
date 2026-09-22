@@ -102,6 +102,7 @@ fn the_wander_model_matches_the_measured_units() {
 /// so the constraint is a sparse-band one rather than a single-cell one, and the conclusion is stronger
 /// than the wander-free reading supported.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn a_sleepier_memory_is_still_refused_by_the_sparse_band_under_wander() {
     let wander = Some(Wander::HOT_AIR);
     let sparse: Vec<(f32, f64)> = [2.0f32, 4.0]
@@ -146,6 +147,7 @@ fn a_sleepier_memory_is_still_refused_by_the_sparse_band_under_wander() {
 /// relation predicts and is unmoved by wander -- as it should be, since a longer memory averages the
 /// counting noise and the wander alike.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn the_dense_wobble_gain_survives_wander() {
     let mut shipped_p95 = Vec::new();
     for (label, wander) in [
@@ -190,6 +192,7 @@ fn the_dense_wobble_gain_survives_wander() {
 /// Bounded rather than merely printed, because the margin is the quantity a future change erodes without
 /// anything else noticing.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn the_shipped_margin_at_the_binding_cell_is_thin_under_wander() {
     let steady = declining_under(2.0, Arm::Shipped, None);
     let hot = declining_under(2.0, Arm::Shipped, Some(Wander::HOT_AIR));
@@ -242,6 +245,7 @@ fn the_shipped_margin_at_the_binding_cell_is_thin_under_wander() {
 /// a minute, identical with and without wander. **The rejection stands on that reason alone**, and the
 /// `TighterOfBoth` residue is untouched by all of it.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn the_caps_sparse_cost_is_wander_free_but_its_crossing_cost_is_not() {
     let wander = Some(Wander::HOT_AIR);
 
@@ -299,6 +303,7 @@ fn the_caps_sparse_cost_is_wander_free_but_its_crossing_cost_is_not() {
 /// a stronger statement of the same concern and it is recorded here rather than in that test, because that
 /// test is about the measured unit and this one is about the box.
 #[test]
+#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn the_conclusions_that_survive_the_whole_wander_box() {
     /// Spreads and timescales bracketing the measured unit.
     const SPREADS: [f64; 3] = [0.05, 0.1258, 0.20];
