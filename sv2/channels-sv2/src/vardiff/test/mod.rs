@@ -5,6 +5,7 @@ use std::{thread, time::Duration};
 mod classic;
 mod cold_start;
 mod outage;
+mod quantisation;
 mod record;
 mod regimes;
 mod relations;
