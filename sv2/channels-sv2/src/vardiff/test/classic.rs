@@ -80,9 +80,7 @@ fn test_try_vardiff_with_less_spm_than_expected_classic() {
 #[test]
 fn test_try_vardiff_hashrate_clamps_to_minimum() {
     let hashrate = TEST_MIN_ALLOWED_HASHRATE * 1.5;
-    let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
-        .unwrap()
-        .into();
+    let target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).unwrap();
 
     let mut vardiff = VardiffState::new_with_min(TEST_MIN_ALLOWED_HASHRATE)
         .expect("Failed to create VardiffState");
@@ -216,61 +214,147 @@ fn test_silent_channel_ease_displacement_is_bounded() {
     );
 }
 
-// The bound is on *consecutive* silence, so any share activity must restore the full budget.
-// Otherwise a long-lived channel that goes briefly quiet many times would eventually exhaust it
-// and stop easing for a genuine decline.
+/// One evaluation, 61 s after the last, of a miner whose true rate is `true_hashrate` and whose
+/// belief is `hashrate`: it finds the shares that rate would at the target that belief sets, rounded
+/// to a whole count. Returns the belief after the evaluation.
+fn evaluate_miner(vardiff: &mut VardiffState, hashrate: f32, true_hashrate: f32) -> f32 {
+    let target =
+        hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
+    let shares = (TEST_SHARES_PER_MINUTE * true_hashrate / hashrate * 61.0 / 60.0).round();
+    simulate_shares_and_wait(vardiff, shares as u32, 61);
+    match vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
+        Ok(Some(updated)) => updated,
+        _ => hashrate,
+    }
+}
+
+// The bound is anchored on the declaration, so it bounds the fall across outages and not only
+// within one. A miner that flaps returns at its declared rate, and each return is evidence at a
+// lowered belief; none of it moves the bound, so every outage rests where the first did. An anchor
+// that followed evidence would rest each outage up to 9x below the last, until
+// `min_allowed_hashrate` stopped it.
 #[test]
-fn test_share_activity_rearms_the_silence_bound() {
+fn test_repeated_outages_never_take_the_belief_below_the_declared_bound() {
     let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
     let mut hashrate = TEST_INITIAL_HASHRATE;
-    let mut target =
-        hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into()).expect("valid target");
+    let bound = TEST_INITIAL_HASHRATE / 9.0;
 
-    // 1. Sustained silence settles at the bound: 9x below the belief that last had evidence.
-    for _ in 0..40 {
-        simulate_shares_and_wait(&mut vardiff, 0, 61);
-        if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
-            hashrate = updated;
-            target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
-                .expect("valid target");
+    for outage in 1..=4 {
+        for _ in 0..40 {
+            hashrate = evaluate_miner(&mut vardiff, hashrate, 0.0);
+            assert!(
+                hashrate >= bound * (1.0 - 1e-3),
+                "outage {outage} took the belief to {hashrate} H/s, below the {bound} H/s bound"
+            );
+        }
+        assert!(
+            (hashrate / bound - 1.0).abs() < 1e-3,
+            "outage {outage} should rest on the {bound} H/s bound, got {hashrate}"
+        );
+
+        // Back for three evaluations at the declared rate: too short to tighten all the way.
+        for _ in 0..3 {
+            hashrate = evaluate_miner(&mut vardiff, hashrate, TEST_INITIAL_HASHRATE);
         }
     }
-    let first_bound = TEST_INITIAL_HASHRATE / 9.0;
+}
+
+// Only silence is bounded. A miner that really has declined below the bound, and still finds
+// shares, is followed below it on that evidence. When it then goes dark the belief is held where the
+// evidence left it: lifting it to the bound would tighten on no evidence, and easing it further would
+// be the unbounded descent the bound exists to stop.
+#[test]
+fn test_a_decline_with_shares_is_followed_below_the_bound_and_held_there() {
+    let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+    let mut hashrate = TEST_INITIAL_HASHRATE;
+    let bound = TEST_INITIAL_HASHRATE / 9.0;
+    let declined = TEST_INITIAL_HASHRATE / 30.0;
+
+    for _ in 0..120 {
+        hashrate = evaluate_miner(&mut vardiff, hashrate, declined);
+    }
     assert!(
-        (hashrate / first_bound - 1.0).abs() < 1e-3,
-        "silence should settle at {first_bound} H/s, got {hashrate}"
+        hashrate < bound / 2.0,
+        "a miner at {declined} H/s that still finds shares should be followed well below the \
+         {bound} H/s bound, but the belief is {hashrate} H/s"
     );
 
-    // 2. Evidence arrives at the lowered belief, re-anchoring the bound to it.
-    simulate_shares_and_wait(&mut vardiff, TEST_SHARES_PER_MINUTE as u32, 61);
-    if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
-        hashrate = updated;
-        target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
-            .expect("valid target");
-    }
-    let rearmed_from = hashrate;
-
-    // 3. Silence may now descend past the previous bound, because the bound is relative to the
-    //    last evidenced belief rather than an absolute floor. Without the re-anchor the channel
-    //    would be stuck at `first_bound` forever, unable to follow a miner that really had slowed.
+    let held = hashrate;
     for _ in 0..40 {
-        simulate_shares_and_wait(&mut vardiff, 0, 61);
-        if let Ok(Some(updated)) = vardiff.try_vardiff(hashrate, &target, TEST_SHARES_PER_MINUTE) {
-            hashrate = updated;
-            target = hash_rate_to_target(hashrate.into(), TEST_SHARES_PER_MINUTE.into())
-                .expect("valid target");
-        }
+        hashrate = evaluate_miner(&mut vardiff, hashrate, 0.0);
+        assert!(
+            (hashrate / held - 1.0).abs() < 1e-6,
+            "silence moved a belief below the bound: {held} H/s became {hashrate} H/s"
+        );
     }
+}
+
+// A re-declaration is what moves the bound. Down, and silence rests a ninth below the new
+// declaration; up past where the belief already rests, and silence holds it there rather than
+// lifting it to the new bound.
+#[test]
+fn test_a_redeclaration_moves_the_silence_bound() {
+    let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+    let mut hashrate = TEST_INITIAL_HASHRATE;
+    let silence = |vardiff: &mut VardiffState, mut hashrate: f32| {
+        for _ in 0..40 {
+            hashrate = evaluate_miner(vardiff, hashrate, 0.0);
+        }
+        hashrate
+    };
+
+    hashrate = silence(&mut vardiff, hashrate);
+    let opening_bound = TEST_INITIAL_HASHRATE / 9.0;
     assert!(
-        hashrate < first_bound,
-        "activity did not re-arm the bound: still at {hashrate} H/s, no lower than the earlier \
-         bound of {first_bound} H/s despite evidence at {rearmed_from} H/s"
+        (hashrate / opening_bound - 1.0).abs() < 1e-3,
+        "silence should rest on the opening declaration's {opening_bound} H/s bound, got {hashrate}"
     );
+
+    vardiff.redeclare_nominal(TEST_INITIAL_HASHRATE / 2.0);
+    hashrate = silence(&mut vardiff, hashrate);
+    let lowered_bound = TEST_INITIAL_HASHRATE / 2.0 / 9.0;
     assert!(
-        hashrate >= rearmed_from / 9.0 * (1.0 - 1e-3),
-        "descent went past the re-armed bound: {hashrate} H/s is below {} H/s",
-        rearmed_from / 9.0
+        (hashrate / lowered_bound - 1.0).abs() < 1e-3,
+        "after a re-declaration at half the rate, silence should rest on {lowered_bound} H/s, got \
+         {hashrate}"
     );
+
+    let resting = hashrate;
+    vardiff.redeclare_nominal(TEST_INITIAL_HASHRATE * 2.0);
+    hashrate = silence(&mut vardiff, hashrate);
+    assert!(
+        (hashrate / resting - 1.0).abs() < 1e-6,
+        "a re-declaration above the belief should leave silence holding it at {resting} H/s, not \
+         move it: got {hashrate}"
+    );
+}
+
+// A declaration that is not a positive, finite number is refused, and the bound stays where the
+// opening belief put it. Each one is made after an evaluation has moved the belief, so accepting it
+// would show: zero would let the next evaluation re-anchor lower, a negative or NaN anchor would
+// disable the bound, and an infinite one would hold the belief where it is.
+#[test]
+fn test_a_non_positive_or_non_finite_redeclaration_is_refused() {
+    let bound = TEST_INITIAL_HASHRATE / 9.0;
+    for declared in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+        let mut hashrate = evaluate_miner(&mut vardiff, TEST_INITIAL_HASHRATE, 0.0);
+        assert!(
+            hashrate < TEST_INITIAL_HASHRATE,
+            "precondition: the first silent evaluation should ease, or the test cannot tell a \
+             refused declaration from an accepted one"
+        );
+
+        vardiff.redeclare_nominal(declared);
+        for _ in 0..40 {
+            hashrate = evaluate_miner(&mut vardiff, hashrate, 0.0);
+        }
+        assert!(
+            (hashrate / bound - 1.0).abs() < 1e-3,
+            "a declaration of {declared} should be refused, leaving silence to rest on {bound} H/s, \
+             but it rested at {hashrate}"
+        );
+    }
 }
 
 /// The estimator must forget on the clock, by `e^(−Δt/tau)`, which is the property the cumulative
@@ -589,12 +673,20 @@ fn test_same_direction_run_accumulates_resets_and_clears() {
 /// `TIGHTEN_MULTIPLIER`. Measured at a ten-hour window: the controller acts on a 6% shortfall but
 /// not on a 41% excess.
 ///
-/// This band is where the controller's settled offset lives — recorded at −6.12% in simulation and
-/// −6.96% on hardware, both inside it. That offset is deliberate rather than an error: a difficulty
-/// settling slightly easy rather than exactly on target keeps the miner's own share-rate excursions inside
-/// a band it tolerates, where a difficulty settled exactly on target would let the upper excursions
-/// cross the point at which a rate-switching miner disconnects. Pinned here because the band is a
-/// product of three constants and changing any of them moves the settled behaviour.
+/// This band is where the controller's settled offset lives, and the offset is inside it at every rate
+/// measured -- `0.206` of the threshold in force at worst (6 shares a minute), and `19.35%`
+/// at worst in percent (2 shares a minute, against a `116%` bar), against the `42%` tightening bar this
+/// test pins. That offset is deliberate
+/// rather than an error: a difficulty settling slightly easy rather than exactly on target keeps the
+/// miner's own share-rate excursions inside a band it tolerates, where a difficulty settled exactly on
+/// target would let the upper excursions cross the point at which a rate-switching miner disconnects.
+/// Pinned here because the band is a product of three constants and changing any of them moves the
+/// settled behaviour.
+///
+/// The band itself is unaffected by the sampler repair -- this test drives explicit share counts rather
+/// than the trajectory harness -- but the offset citation was not, and an earlier form of this comment
+/// gave it as a single `−6.12%` in simulation. `regimes::a_stable_channel_is_left_largely_alone` holds the
+/// re-derived readings; see `MIN_THRESHOLD_FRACTION` for why the ratio is the rate-invariant form.
 #[test]
 fn test_asymmetry_leaves_a_dead_zone_of_uncorrected_over_delivery() {
     use crate::vardiff::clock::MockClock;
@@ -741,6 +833,35 @@ fn test_consecutive_retargets_close_a_growing_share_of_the_gap() {
             "the step should grow by STEP_FRACTION_GROWTH: {pair:?}"
         );
     }
+}
+
+/// A reversal restarts the retarget run, however long the run before it.
+///
+/// The run sizes each step, so the first move back closes `STEP_FRACTION_BASE` of the gap and the
+/// next one in its direction closes one `STEP_FRACTION_GROWTH` more. Three eases on silence, then
+/// two tightens on a burst.
+#[test]
+fn test_a_reversal_restarts_the_retarget_run() {
+    let mut vardiff = new_test_vardiff_state().expect("Failed to create VardiffState");
+    let mut belief = TEST_INITIAL_HASHRATE;
+
+    let mut runs = Vec::new();
+    for shares in [0, 0, 0, 1_000, 1_000] {
+        simulate_shares_and_wait(&mut vardiff, shares, 300);
+        let target = hash_rate_to_target(belief.into(), TEST_SHARES_PER_MINUTE.into())
+            .expect("valid target");
+        belief = vardiff
+            .try_vardiff(belief, &target, TEST_SHARES_PER_MINUTE)
+            .expect("try_vardiff failed")
+            .expect("every evaluation here should retarget");
+        runs.push(vardiff.fire_run());
+    }
+
+    assert_eq!(
+        runs,
+        [(-1, 1), (-1, 2), (-1, 3), (1, 1), (1, 2)],
+        "the tightens after three eases should run 1 then 2, not carry the eases' run"
+    );
 }
 
 /// Both accumulating mechanisms can actually reach their stated ceilings.

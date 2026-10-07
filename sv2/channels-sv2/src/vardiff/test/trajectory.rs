@@ -42,6 +42,24 @@ const CLOCK_ORIGIN: u64 = 1_000_000;
 /// Salt for the wander stream, so adding wander to a trial does not disturb its share sampling.
 const WANDER_SEED_SALT: u64 = 0x_4AD3_0000_0000_0001;
 
+/// Trial `i`'s seed.
+///
+/// A tick seeds its generators with the trial's seed plus `elapsed`, which steps by [`TICK_SECS`], so
+/// trials whose seeds differ by less than a tick never hand a generator the same seed. Each block of
+/// `TICK_SECS` trials therefore takes consecutive seeds, and each block sits `2^32` above the last,
+/// farther than any run's elapsed seconds reach. Pinned by `no_two_draws_in_a_run_share_a_seed`.
+pub(super) fn trial_seed(i: u64) -> u64 {
+    SEED.wrapping_add(i % TICK_SECS + ((i / TICK_SECS) << 32))
+}
+
+/// The seeds one tick of a trial hands its share generator and its wander generator.
+fn tick_seeds(seed: u64, elapsed: u64) -> (u64, u64) {
+    (
+        seed.wrapping_add(elapsed),
+        (seed ^ WANDER_SEED_SALT).wrapping_add(elapsed),
+    )
+}
+
 /// XorShift64, so sampling is reproducible without a dev-dependency.
 pub(super) struct XorShift64(u64);
 
@@ -49,7 +67,7 @@ impl XorShift64 {
     /// Seeds the generator, avalanching the seed first.
     ///
     /// **The avalanche is load-bearing and its absence was a silent, total defect.** This generator is
-    /// constructed *per tick* from `seed ^ elapsed`, so consecutive constructions differ only in low
+    /// constructed *per tick* from `seed + elapsed`, so consecutive constructions differ only in low
     /// bits — and one xorshift round does not carry a low-bit change into the top 53 bits that
     /// [`Self::next_f64`] reads. Without mixing, the first output across 2880 consecutive per-tick
     /// seeds spanned `0.385849` to `0.385864`: a constant to five decimal places.
@@ -75,6 +93,12 @@ impl XorShift64 {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         Self(z ^ (z >> 31))
+    }
+
+    /// Test-only: draws beyond the first, which is the mode `sample_poisson`'s Knuth loop uses and which
+    /// `the_generator_mixes_consecutive_seeds` does not cover -- it tests only the first draw per seed.
+    pub(super) fn next_f64_for_audit(&mut self) -> f64 {
+        self.next_f64()
     }
 
     fn next_f64(&mut self) -> f64 {
@@ -105,7 +129,7 @@ const MAX_SAMPLED_SHARES: u32 = 1_000_000;
 /// one exists for, because the defect was in how the generator is *seeded* per tick, not in the
 /// sampling arithmetic.
 pub(super) fn sample_tick(seed: u64, elapsed: u64, lambda: f64) -> u32 {
-    sample_poisson(&mut XorShift64::new(seed.wrapping_add(elapsed)), lambda)
+    sample_poisson(&mut XorShift64::new(tick_seeds(seed, elapsed).0), lambda)
 }
 
 pub(super) fn sample_poisson(rng: &mut XorShift64, lambda: f64) -> u32 {
@@ -138,6 +162,15 @@ pub(super) fn sample_poisson(rng: &mut XorShift64, lambda: f64) -> u32 {
 ///
 /// Shared with `sample_poisson`'s large-mean branch rather than written twice, so a trajectory that
 /// crosses `KNUTH_LIMIT` and one that carries wander draw from the same generator.
+/// Test-only access to the normal draw, for `instruments.rs`.
+///
+/// Exposed because `sample_standard_normal` feeds both `sample_poisson`'s large-mean branch and every
+/// `Wander` step, and was never tested. An instrument used by two consumers and validated by neither is
+/// the shape both of this harness's defects took.
+pub(super) fn sample_standard_normal_for_audit(rng: &mut XorShift64) -> f64 {
+    sample_standard_normal(rng)
+}
+
 fn sample_standard_normal(rng: &mut XorShift64) -> f64 {
     let (u1, u2) = (rng.next_f64(), rng.next_f64());
     (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos()
@@ -200,6 +233,17 @@ impl Wander {
     /// `x <- rho*x + eps`, with `rho = e^(-dt/T_c)` and `eps` scaled so the stationary spread is
     /// `sigma` whatever `dt` is -- which is what makes the disturbance a property of the miner rather
     /// than of how often the harness happens to look.
+    /// Test-only wrapper so  can drive the process
+    /// directly. The guard must exercise the same stepping the harness uses, not a copy of it.
+    pub(super) fn advance_pub(
+        &self,
+        log_state: &mut f64,
+        dt_secs: u64,
+        rng: &mut XorShift64,
+    ) -> f64 {
+        self.advance(log_state, dt_secs, rng)
+    }
+
     fn advance(&self, log_state: &mut f64, dt_secs: u64, rng: &mut XorShift64) -> f64 {
         let rho = (-(dt_secs as f64) / (self.t_c_secs as f64)).exp();
         let step_sd = self.sigma * (1.0 - rho * rho).sqrt();
@@ -208,11 +252,22 @@ impl Wander {
     }
 }
 
+/// Test-only access to the aggregator, for `instruments.rs`.
+pub(super) fn median_for_audit(values: Vec<f64>) -> f64 {
+    median(values)
+}
+
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).expect("no NaN readings"));
     let mid = values.len() / 2;
     if values.len() % 2 == 0 {
-        (values[mid - 1] + values[mid]) / 2.0
+        // Midpoint in the numerically stable form rather than `(a + b) / 2.0`. The naive form overflows
+        // when both middle values are large: `ticks_to_converge` maps a trial that never converged to
+        // `f64::MAX`, so a cell where most trials never converge averages `MAX + MAX` to `inf`. That
+        // happened to be harmless, because the caller's `as usize` saturates `inf` to the same
+        // `usize::MAX` sentinel it wanted -- but it was harmless by accident, and this form does not
+        // depend on the accident. Found by `instruments::a_trial_that_never_converges_is_counted_not_dropped`.
+        values[mid - 1] + (values[mid] - values[mid - 1]) / 2.0
     } else {
         values[mid]
     }
@@ -250,8 +305,10 @@ pub(super) struct Trial {
     /// miner was present for, which is the quantity that means something: how wrong the difficulty is
     /// when there is someone to serve it to.
     pub(super) live_ticks: usize,
-    /// Ticks from the start of the measured span until the belief is first within 10% of the truth, or
-    /// `None` if it never gets there.
+    /// Ticks from the start of the measured span until the belief first reaches the truth, or `None` if
+    /// it never gets there. Reaching it is coming within 10% of it or crossing it: a step can carry the
+    /// belief from outside the band on one side to outside it on the other, and that belief has still
+    /// passed through the truth.
     ///
     /// Only meaningful on a trajectory that starts wrong, which until now none of them did. Ten percent
     /// because it is inside every threshold the controller applies, so reaching it means the controller
@@ -272,7 +329,9 @@ pub(super) struct Trial {
 /// choice. See `sparse_parity.rs`.
 ///
 /// [`SPARSE_SPM_SEAM`]: crate::vardiff::classic
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No `Eq`: `TauSplit`'s rate is an `f32`, and an arm is only ever compared for equality in a test
+// assertion, never hashed or used as a map key.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum Arm {
     /// What this crate ships: the directional multiplier and the persistence discount apply at every
     /// share rate.
@@ -285,6 +344,12 @@ pub(super) enum Arm {
     SigmaMatchedCap,
     /// The shipped boundary, with the window cap never looser than the `sigma`-matched window.
     TighterOfBothCaps,
+    /// The shipped controller, with a different estimator memory either side of `split_rate`.
+    TauSplit {
+        split_rate: f32,
+        below: u64,
+        at_or_above: u64,
+    },
     /// The shipped controller, with the estimator's time constant set to this many seconds.
     ///
     /// Only the memory changes: the cap stays the constant it is, which is what varying `tau` alone
@@ -315,6 +380,11 @@ pub(super) fn run_trial(
         Arm::SigmaMatchedCap => fresh.with_window_cap_form(WindowCapForm::SigmaMatched),
         Arm::TighterOfBothCaps => fresh.with_window_cap_form(WindowCapForm::TighterOfBoth),
         Arm::Tau(secs) => fresh.with_tau_secs(secs),
+        Arm::TauSplit {
+            split_rate,
+            below,
+            at_or_above,
+        } => fresh.with_tau_split(split_rate, below, at_or_above),
     };
 
     let mut believed = START_HASHRATE;
@@ -327,6 +397,8 @@ pub(super) fn run_trial(
     let mut final_error_pct = 0.0;
     let mut final_threshold_pct = f64::NAN;
     let mut ticks_to_converge = None;
+    // Whether the first scored reading was over-difficulty, which is the side a crossing leaves.
+    let mut started_over = None;
     let mut measured_ticks = 0usize;
     let mut live_ticks = 0usize;
 
@@ -341,7 +413,7 @@ pub(super) fn run_trial(
                 Some(w) => w.advance(
                     &mut wander_log,
                     TICK_SECS,
-                    &mut XorShift64::new(seed ^ WANDER_SEED_SALT ^ elapsed),
+                    &mut XorShift64::new(tick_seeds(seed, elapsed).1),
                 ),
                 None => 1.0,
             };
@@ -363,7 +435,8 @@ pub(super) fn run_trial(
         if measuring && delivered_now > 0.0 {
             let error_pct = (believed as f64 / delivered_now).ln() * 100.0;
             live_ticks += 1;
-            if ticks_to_converge.is_none() && error_pct.abs() < 10.0 {
+            let crossed = (error_pct > 0.0) != *started_over.get_or_insert(error_pct > 0.0);
+            if ticks_to_converge.is_none() && (error_pct.abs() < 10.0 || crossed) {
                 ticks_to_converge = Some(measured_ticks);
             }
             errors.push(error_pct.abs());
@@ -466,7 +539,7 @@ pub(super) fn measure_arm_wander(
                 spm,
                 warm_up_secs,
                 measured_secs,
-                SEED.wrapping_add(i as u64),
+                trial_seed(i as u64),
                 arm,
                 wander,
             )
@@ -491,6 +564,52 @@ pub(super) fn measure_arm_wander(
         ) as usize),
         final_threshold_pct: pick(runs.iter().map(|r| r.final_threshold_pct).collect()),
     }
+}
+
+/// How many of `trials` trajectories `arm` changes against [`Arm::Shipped`], and how far it moves the
+/// median settled reading, in points.
+///
+/// Both arms run each trajectory on the same seeds, so a trajectory counts as unchanged when it ends on
+/// the same belief after the same number of retargets: the two controllers made the same decisions. A
+/// median shift alone cannot tell an arm that acts rarely and by a lot from one that acts often and by a
+/// little, and over a few dozen trials it reads zero or not according to where the changed trajectories
+/// happen to fall.
+pub(super) fn changed_against_shipped(
+    delivered: &impl Fn(u64) -> f64,
+    spm: f32,
+    warm_up_secs: u64,
+    measured_secs: u64,
+    trials: usize,
+    arm: Arm,
+    wander: Option<Wander>,
+) -> (usize, f64) {
+    let pairs: Vec<(Trial, Trial)> = (0..trials)
+        .map(|i| {
+            let run = |arm| {
+                run_trial(
+                    delivered,
+                    spm,
+                    warm_up_secs,
+                    measured_secs,
+                    trial_seed(i as u64),
+                    arm,
+                    wander,
+                )
+            };
+            (run(Arm::Shipped), run(arm))
+        })
+        .collect();
+    let changed = pairs
+        .iter()
+        .filter(|(shipped, other)| {
+            shipped.final_hashrate != other.final_hashrate || shipped.retargets != other.retargets
+        })
+        .count();
+    let settled = |pick: fn(&(Trial, Trial)) -> &Trial| {
+        let errors = pairs.iter().map(|pair| pick(pair).final_error_pct);
+        median(errors.collect())
+    };
+    (changed, settled(|pair| &pair.1) - settled(|pair| &pair.0))
 }
 
 /// A miner that never changes.
@@ -567,13 +686,14 @@ fn the_share_feed_responds_to_the_difficulty_in_force() {
     let spm = TEST_SHARES_PER_MINUTE;
     let minutes = 120u64;
 
+    // Seeded per tick, as `run_trial` does. This test previously built ONE generator and drew from it in
+    // a loop -- a mode no trajectory uses -- which is half of why the pinned-first-draw defect survived
+    // as long as it did: the harness's own coupling check was validating a configuration that never runs.
     let count_at = |believed: f64| -> u64 {
-        let mut rng = XorShift64::new(SEED);
         let mut total = 0u64;
         for minute in 1..=minutes {
             let lambda = (START_HASHRATE as f64 / believed) * spm as f64;
-            total += sample_poisson(&mut rng, lambda) as u64;
-            let _ = minute;
+            total += sample_tick(SEED, TICK_SECS * minute, lambda) as u64;
         }
         total
     };
@@ -591,7 +711,7 @@ fn the_share_feed_responds_to_the_difficulty_in_force() {
 
 /// **The generator must decorrelate consecutive seeds, because that is how the harness uses it.**
 ///
-/// `run_trial` constructs a fresh generator per tick from `seed ^ elapsed`, so the only mode that
+/// `run_trial` constructs a fresh generator per tick from `seed + elapsed`, so the only mode that
 /// matters is the *first* output from nearby seeds. The sampler tests below use a persistent generator
 /// and therefore could not see -- and did not see -- that one xorshift round left that first output
 /// constant to five decimal places, which made every trajectory's share feed deterministic and starved
@@ -701,6 +821,37 @@ fn the_delivered_feed_is_poisson() {
             "lambda {lambda} delivered zero shares on {:.2}% of ticks against the {:.2}% a Poisson              feed gives. A zero-share tick is the input to the silence apparatus, so getting this              wrong makes a whole branch of the controller unreachable without failing anything else",
             zero_fraction * 100.0,
             expected_zero * 100.0
+        );
+    }
+}
+
+/// **No two draws in a run may share a generator seed, or its trials are not independent samples.**
+///
+/// Every tick builds a fresh share generator and a fresh wander generator from a seed, so two trials,
+/// or two streams, that hand a generator the same seed draw the same numbers there, and a median over
+/// them counts one sample twice. Checked on the seeds `run_trial` constructs, for the most trials any
+/// test runs at the span it runs them, and for several blocks of trials over 48 hours, the longest
+/// span any test runs.
+#[test]
+fn no_two_draws_in_a_run_share_a_seed() {
+    for (trials, ticks) in [(12_800u64, 240u64), (640, 2880)] {
+        let mut seeds: Vec<u64> = (0..trials)
+            .flat_map(|i| {
+                (1..=ticks).flat_map(move |k| {
+                    let (share, wander) = tick_seeds(trial_seed(i), TICK_SECS * k);
+                    [share, wander]
+                })
+            })
+            .collect();
+        let draws = seeds.len();
+        seeds.sort_unstable();
+        seeds.dedup();
+        assert_eq!(
+            seeds.len(),
+            draws,
+            "{trials} trials of {ticks} ticks handed their generators {} distinct seeds among {draws}, so \
+             some draws repeat across trials and the run is fewer independent samples than its count",
+            seeds.len()
         );
     }
 }

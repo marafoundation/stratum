@@ -6,16 +6,22 @@
 //! each return has to tighten it back -- and those two moves are deliberately not priced the same. So the
 //! question is not where one ease stops but where the pair comes to rest after many rounds.
 //!
-//! **It comes to rest under-difficulty, which is the mirror of the cold-start lock.** `cold_start.rs` finds
-//! an over-declared sparse channel pinned *above* the truth by the displacement bound. A flapping channel
-//! sits persistently *below* it, because easing on an outage is cheap and tightening on a return costs
-//! `TIGHTEN_MULTIPLIER` times as much evidence, so the belief ratchets down. Both failures are the
-//! controller unable to tell absence from a wrong belief; they run in opposite directions and, as
-//! `the_displacement_bound_is_not_what_binds_on_a_flapping_channel` shows, do not share a cause.
+//! **It comes to rest under-difficulty.** A flapping channel sits persistently *below* the truth, because
+//! easing on an outage is cheap and tightening on a return costs `TIGHTEN_MULTIPLIER` times as much
+//! evidence, so the belief ratchets down: the controller cannot tell absence from a wrong belief. The
+//! displacement bound does not stop the ratchet: it is anchored on the declared hashrate, so it bounds the
+//! fall across outages at a ninth of the declaration, and the ratchet comes to rest well above that.
 //!
-//! Median absolute tracking error over 12 h at 50% duty, 2 spm against 12 spm: `168%` / `103%` on a 30 min
-//! cycle, `107%` / `49%` on 60 min, `63%` / `21%` on 120 min. So the sparse channel is 1.1x to 3.6x worse
+//! Median absolute tracking error over 12 h at 50% duty, 2 spm against 12 spm: `133%` / `121%` on a 30 min
+//! cycle, `98%` / `53%` on 60 min, `61%` / `27%` on 120 min. So the sparse channel is 1.1x to 2.3x worse
 //! depending on the cycle -- not a constant factor.
+//!
+//! **Re-derived against the repaired sampler, and this file came through almost untouched.** Its up-phase
+//! sits at `lambda = 2` shares a tick, which is where the broken sampler's deterministic count happened to
+//! equal the mean, so the ratchet, its magnitudes and the resonance all reproduce within a point or two.
+//! The one number that moved was the churn *comparator*: stable-channel retargets were measured at `0.25`
+//! and `0.33` an hour against a feed that gave the controller nothing to fire on, so the flapping multiple
+//! was recorded as `33x`/`55x` when it is `9x`/`29x`. The defect was in the baseline, not in the arm.
 //!
 //! **Medians, not final readings.** A cyclic trajectory's last tick lands at a fixed phase of the cycle,
 //! and that phase differs between cells: a 12 h run ends 240 s after a return on a 30 min cycle and 2940 s
@@ -24,12 +30,12 @@
 //! alone. Every cross-cell claim here is asserted on medians, which average over phase.
 //!
 //! Under difficulty-weighted accounting none of this costs payout -- a share is credited at the difficulty
-//! it was found at. It costs load: four to five times the intended share bandwidth, and 33x to 55x the
+//! it was found at. It costs load: four to five times the intended share bandwidth, and 9x to 29x the
 //! retargets a stable channel actually makes.
 //!
 //! **The asymmetry is the cause, confirmed by mutation.** With `TIGHTEN_MULTIPLIER` weakened from `8.0` to
-//! `3.0` -- a factor of 2.7 -- the worst cell's under-difficulty shrinks by the same factor of 2.7 while
-//! its retargets rise from 98 to 157. The under-difficulty is the price of the reluctance and the churn is
+//! `3.0` -- a factor of 2.7 -- the under-difficulty shrinks in every cell, by `1.3x` to `4.7x`, and the worst
+//! cell's retargets rise from 87 to 139. The under-difficulty is the price of the reluctance and the churn is
 //! the price of giving it up.
 //!
 //! *(`3.0` because the constant assertion beside `MIN_EFFECTIVE_TIGHTEN_MULTIPLIER` refuses any multiplier
@@ -42,7 +48,8 @@ const MEASURED_HOURS: u64 = 12;
 const TRIALS: usize = 20;
 /// The estimator's memory, in seconds. Mirrors `EWMA_TAU_SECS`, which the cycle sweep is indexed against.
 const TAU_SECS: u64 = 360;
-/// Mirrors `MAX_SILENT_DISPLACEMENT`, which is private. Used to show the bound is *not* what binds here.
+/// Mirrors `MAX_SILENT_DISPLACEMENT`, which is private. Used to show the bound's floor is not where a
+/// flapping channel rests.
 const EXPECTED_DISPLACEMENT: f64 = 9.0;
 
 /// `period_secs` long cycles, dark for `down_secs` of each.
@@ -73,7 +80,7 @@ fn stable_retargets_per_hour(spm: f32) -> f64 {
     trial.retargets as f64 / MEASURED_HOURS as f64
 }
 
-/// **A flapping miner settles under-difficulty at every rate and cycle, never over.**
+/// **A flapping miner settles under-difficulty at every rate and cycle.**
 ///
 /// The direction is the finding. A disturbance that looks like departure and is not should, naively, leave
 /// the channel over-difficulty -- that is what a decline does. It does the opposite, because the two moves
@@ -83,6 +90,12 @@ fn stable_retargets_per_hour(spm: f32) -> f64 {
 /// Asserted as a sign rather than a magnitude, because the magnitude is cycle-dependent and the sign is
 /// not. A cell that came out over-difficulty would mean the asymmetry had stopped being the dominant
 /// effect and everything below would need re-reading.
+///
+/// *Settles* is the median trial's last tick, and it does not mean never over. Across twelve independent
+/// seed sets of these 20 trials, one or two of the eight cells have some trial over-difficulty during the
+/// run, always at 12 spm, by up to `+12%` on the 120 min cycle. At 12 spm up to three trials in 20 end over
+/// on the 120 min cycle, and in the other cells at most one does.
+/// The median trial ends under in every cell on every set.
 #[test]
 fn a_flapping_miner_settles_under_difficulty_at_every_cycle() {
     for (period, down) in [(3600u64, 600u64), (3600, 1800), (1800, 900), (7200, 3600)] {
@@ -112,16 +125,19 @@ fn a_flapping_miner_settles_under_difficulty_at_every_cycle() {
     }
 }
 
-/// **And the displacement bound is not what binds, so the asymmetry is the thing to look at.**
+/// **And the displacement bound is not where it rests, so the asymmetry is the thing to look at.**
 ///
-/// Worth separating because the bound is the obvious suspect -- it is what governs a single outage, and
-/// `cold_start.rs` shows it locking a channel when it does bind. Here it never does: an outage of ten to
-/// thirty minutes does not ease far enough to reach one ninth of the last evidenced belief, so every cell
-/// rests well above that floor.
+/// Worth separating because the bound is the obvious suspect -- it is what governs a single outage. No
+/// cell here comes within reach of one ninth of the opening belief, so the bound's floor is not where a
+/// flapping channel rests. That is all this checks.
 ///
-/// If this reversed, the two failures would have one cause and one fix. They do not.
+/// Within the longer outages the floor does bind. At 2 spm on the 120 min cycle it clamps 4828 of 5519
+/// silent evaluations, and with the bound removed the channel retargets 250 times in 12 h rather than 59
+/// and its median error rises from `61%` to `77%`. Where it rests moves by under 1% on the 30 min cycle
+/// and on the 60 min one dark for 10 minutes, and by 26% on the 120 min cycle, and this test passes with
+/// the bound removed: it guards the resting position, not the bound.
 #[test]
-fn the_displacement_bound_is_not_what_binds_on_a_flapping_channel() {
+fn the_displacement_bound_is_not_where_a_flapping_channel_rests() {
     let floor = START_HASHRATE as f64 / EXPECTED_DISPLACEMENT;
 
     for (period, down) in [(3600u64, 600u64), (1800, 900), (7200, 3600)] {
@@ -129,8 +145,8 @@ fn the_displacement_bound_is_not_what_binds_on_a_flapping_channel() {
         assert!(
             trial.final_hashrate as f64 > floor * 1.5,
             "a {period}s cycle dark {down}s rested at {:.3e} H/s, within reach of the {floor:.3e} \
-             displacement floor. If the bound binds here too, this failure and the cold-start lock share \
-             a cause and `cold_start.rs`'s mechanism claim needs widening",
+             displacement floor. If the bound binds here, it rather than the tighten asymmetry sets \
+             where a flapping channel rests",
             trial.final_hashrate
         );
     }
@@ -145,19 +161,29 @@ fn the_displacement_bound_is_not_what_binds_on_a_flapping_channel() {
 /// discontinuity for each retarget.
 ///
 /// The churn comparator is the *measured* stable rate rather than `regimes.rs`'s `<= 4` an hour ceiling. A
-/// stable channel actually retargets 0.25 times an hour at 2 shares a minute and 0.33 at 12, so the
-/// flapping multiple is 33x and 55x where the ceiling would imply 2x to 4.5x. Comparing against an SLA
+/// stable channel actually retargets 0.83 times an hour at 2 shares a minute and 0.83 at 12, so the
+/// flapping multiple is **9x and 29x** where the ceiling would imply about 2x to 6x. Comparing against an SLA
 /// ceiling reads as though the churn were near-normal; it is nowhere near normal.
+///
+/// Re-derived against the repaired sampler: the multiples were recorded as 33x and 55x, and the error was
+/// entirely in the baseline rather than the flapping arm. See `MIN_CHURN_MULTIPLE`.
 #[test]
-#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
 fn a_flapping_miner_costs_several_times_the_intended_load() {
     /// The worst cycle in the sweep below.
     const PERIOD_SECS: u64 = 1800;
     const DOWN_SECS: u64 = 900;
     /// Least share-load multiple that counts as the effect being real rather than sampling.
     const MIN_SHARE_MULTIPLE: f64 = 3.0;
-    /// Least churn multiple over *measured* stable operation. Readings are 33x and 55x.
-    const MIN_CHURN_MULTIPLE: f64 = 20.0;
+    /// Least churn multiple over *measured* stable operation.
+    ///
+    /// **Re-derived.** This recorded `33x` and `55x`, and both were wrong in the comparator rather than in
+    /// the flapping arm: the stable baselines they divided by were `0.25` and `0.33` retargets an hour,
+    /// measured when the share feed suppressed zero-share ticks and so gave the controller nothing to fire
+    /// on. Against real stable churn of `0.83` and `0.83` the multiples are **9x and 29x**. The flapping
+    /// numerator (`7.2` and `23.8` an hour) was not where the error was, which is the same reason this
+    /// whole file survived the repair: its up-phase sits at `lambda = 2`, where the broken count happened
+    /// to equal the mean.
+    const MIN_CHURN_MULTIPLE: f64 = 8.0;
 
     for spm in [2.0f32, 12.0] {
         let trial = flapping(PERIOD_SECS, DOWN_SECS, spm);
@@ -197,8 +223,8 @@ fn a_flapping_miner_costs_several_times_the_intended_load() {
 /// maximum, so a monotone falloff was mistaken for the far flank of a peak that had never been located.
 /// Sweeping from `tau` to `40*tau` finds the shape is real and the position was wrong by a factor of five.
 ///
-/// Median absolute error at 2 shares a minute, 50% duty: `87%` at `tau`, `119%` at `3*tau`, `168%` at
-/// `5*tau`, `107%` at `10*tau`, `63%` at `20*tau`, `32%` at `40*tau`. A genuine interior maximum with
+/// Median absolute error at 2 shares a minute, 50% duty: `90%` at `tau`, `119%` at `3*tau`, `133%` at
+/// `5*tau`, `98%` at `10*tau`, `61%` at `20*tau`, `49%` at `40*tau`. A genuine interior maximum with
 /// falloff on both sides, which is what confines the cost to a band rather than making it a general
 /// degradation.
 ///

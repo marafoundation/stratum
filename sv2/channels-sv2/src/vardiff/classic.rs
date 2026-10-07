@@ -5,7 +5,7 @@ use tracing::debug;
 /// Default minimum hashrate (H/s) if not specified.
 const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 
-/// Most the believed hashrate may fall below the last belief that had evidence behind it.
+/// Most the believed hashrate may fall below the channel's declared hashrate while no shares arrive.
 ///
 /// *Displacement* is that ratio, `d = H_true / H_believed`. A belief `d` times too low serves a
 /// difficulty `d` times too easy, so a miner asked for `r*` shares a minute sends `r*·d` when it
@@ -20,28 +20,22 @@ const DEFAULT_MIN_HASHRATE: f32 = 1.0;
 /// `min_allowed_hashrate` is no substitute: from a 200 TH belief its `1.0` H/s default is some
 /// thirty eases away.
 ///
-/// Re-anchors on evidence: [`VardiffState::evidenced_hashrate`] moves whenever an evaluation sees a
-/// share, so a declining miner that still submits *at a rate the controller evaluates against* is not
-/// held back by it.
+/// Anchored on the declaration: [`VardiffState::declared_hashrate`] is the belief the first
+/// evaluation is handed, which for a channel opened at its declared `nominal_hash_rate` is that
+/// declaration, and only [`VardiffState::redeclare_nominal`] moves it after that. Shares never do,
+/// because a fade is a run of small evidence, and an anchor that followed it would carry the bound
+/// down with the belief. So this is a bound **per channel, not per outage**: a channel that goes dark
+/// repeatedly rests no lower than a ninth of its declaration however often it does. A channel opened
+/// at anything other than a declaration is anchored on that instead: a translator opens each SV1
+/// miner, which declares nothing, at its configured minimum hashrate, so there the bound is a ninth
+/// of that minimum, and a miner running at twice the minimum can be eased to `18×` below its truth.
 ///
-/// **That qualification is load-bearing, and without it the sentence is false.** "Whenever shares
-/// arrive" is a weak guarantee when arrivals are rare compared with the evaluation cadence, and the
-/// case where it fails is a channel opened at a difficulty far too hard: it delivers `r*/d` for a
-/// declaration wrong by `d`, so at `d = 100` and 2 shares a minute that is one share per fifty minutes,
-/// almost every evaluation sees none, and the anchor stays at the *opening* belief -- a number no
-/// evidence ever supported. The ease then floors at one ninth of it and stops.
-///
-/// Measured: such a channel rests at `9x` below its declared nominal, which is still `11x` above the
-/// truth, and stays there for at least 48 hours with no further retargets. Raising this constant to
-/// `90` lets the same channel converge, which is what identifies this bound as the cause rather than
-/// the threshold or the step schedule. The same over-declaration at 12 shares a minute recovers, because
-/// there a mis-set channel still delivers often enough to re-anchor. See `test/cold_start.rs`.
-///
-/// So the bound is a bounded-regret policy in both directions, not only against a returning miner's
-/// share flood: it also bounds how far an over-declaration can be corrected, and at sparse rates that
-/// second cost is unbounded in duration. Not repaired here -- the fix is a choice between anchoring on
-/// something other than an unverified opening belief, distinguishing silence from over-difficulty, and
-/// admitting fewer sparse channels -- but it is no longer undocumented.
+/// Only silence is bounded. An evaluation that sees a share is not floored, so a miner that really
+/// has declined below the bound is followed on its evidence, and nine leaves room for the partial
+/// failures a miner still reports through: two of three hashboards lost leave a third of the
+/// declaration, five of six a sixth. Where shares are rare compared with the evaluation cadence,
+/// only the evaluations that see one can take the belief below the bound. And silence never raises a
+/// belief: one that evidence has already taken below the bound is held there.
 const MAX_SILENT_DISPLACEMENT: f32 = 9.0;
 
 /// Share rate below which the decision threshold is sized from a Poisson interval rather than a
@@ -69,10 +63,42 @@ const POISSON_Z: f64 = 2.576;
 /// has earned its full discount. Over-delivery below that is never corrected at any window length.
 ///
 /// That gap is the asymmetric dead zone, and it is deliberate: it is where the controller's
-/// settled offset comes from. The offset is recorded at −6.12% in simulation and −6.96% on
-/// hardware, comfortably inside the band, and it is load-bearing rather than an error — it parks
-/// the excursion band below the level at which a switch-miner leaves. Widening this constant or
-/// narrowing the multiplier moves the dead zone and therefore moves the offset.
+/// settled offset comes from. Widening this constant or narrowing the multiplier moves the dead
+/// zone and therefore moves the offset.
+///
+/// # Why this value, and it is not the reason this comment used to give
+///
+/// **The derivable justification is a noise floor.** Firing on counting noise requires the decaying
+/// threshold to reach the noise level, `ev(w) + floor <= sigma`; so if `floor >= sigma` there is no
+/// window that satisfies it and noise-driven hunting is impossible at any window length. At the
+/// shipped memory `0.05` sits at `1 sigma` for `r*tau = 12 000` — 33.3 shares a minute — and at
+/// `0.949 sigma` at [`REFERENCE_SPM`]. So the value very nearly pins hunting to impossible at the
+/// rate the rest of the boundary is calibrated against, by arithmetic and with no appeal to miner
+/// behaviour.
+///
+/// **What this comment asserted instead, for months, was that the dead zone "parks the excursion
+/// band below the level at which a switch-miner leaves" — and that threshold has never been
+/// sourced.** It is an amplitude claim; the only number attached to it anywhere is a *duration*, a
+/// 600–1800 s repointing delay introduced hypothetically. Six places in the corpus inherit the claim
+/// from this comment, so it is labelled here rather than repeated: **assumption, unmeasured.**
+///
+/// Measured since, and it does not vindicate the sentence so much as make it unnecessary: across 19
+/// production units held at an identical difficulty, spanning `1.57x` in sustained misplacement over
+/// 259 unit-hours, **zero departed** — an upper bound of one per 3.6 unit-days at up to `1.372x`.
+/// Whether those units run any switching policy at all is unknown, so read it as a bound on the
+/// hazard and not as a threshold.
+///
+/// **The offset is a fraction of the threshold in force, not a figure in percent**: it is bounded at
+/// `0.206` of that threshold (worst, at 6 shares a minute), and because the threshold is itself wide at
+/// sparse rates the largest offset in percent is at 2 shares a minute instead: `19.35%` against a
+/// `116%` bar, `0.167` of it. Both readings are held by
+/// `regimes::a_stable_channel_is_left_largely_alone`. An earlier form of this comment cited a single
+/// `−6.12%` in simulation, which was one rate's reading standing in for a rate-dependent quantity —
+/// and measured against the broken feed besides. The `−6.96%` hardware figure is unaffected, having
+/// come off a rig rather than the harness, but it is likewise one deployment's rate, and it **cannot be
+/// converted to the ratio form** from anything recorded here: the threshold in force was not captured
+/// alongside it. So the two halves of this offset are still quoted in different units, and closing that
+/// needs the rig to log the bar it was applying — one field, and the next hardware run can supply it.
 pub(crate) const MIN_THRESHOLD_FRACTION: f64 = 0.05;
 
 /// Deviation required after one minute of observation, as a fraction, on the dense branch.
@@ -261,8 +287,8 @@ const _: () = assert!(
 ///
 /// What it buys, as a lift: at 6.45 shares a minute the evidence term cannot fall below 4.64 pp, so the
 /// asymptotic bar is 9.64 pp rather than the bare 5.00 pp floor. Measured on a stable channel, which is
-/// the case it exists for, that cuts unnecessary retargets 2.5x at 6 shares a minute (2.75 an hour to
-/// 1.08) and 5.1x at 12 (1.67 to 0.33).
+/// the case it exists for, that cuts unnecessary retargets 1.3x at 6 shares a minute (3.08 an hour to
+/// 2.42) and 2.1x at 12 (1.75 to 0.83).
 ///
 /// The same lift is the cost. The term is a term *in the threshold*, so holding it up delays every
 /// retarget the threshold gates, including the wanted ones: a real decline on a long-quiet channel
@@ -311,8 +337,27 @@ const NOMINAL_TICK_SECS: u64 = 60;
 /// `sigma = sqrt(30 / (r * tau))` with `r` in shares per minute -- 20.4% at 2, 11.8% at 6, 5.3% at 30 --
 /// so `r * tau` is the only quantity that buys precision, and `tau` is the only half of it this crate
 /// controls. Buying precision with `tau` costs agility, which is why this is a balance and not a
-/// maximum: 360 is the shortest window that stays safe on a sustained decline at the 2-4 share
-/// rates, and those rates are what select it. A channel above the seam would prefer a longer one.
+/// maximum.
+///
+/// **Which cell strikes that balance was re-derived against the repaired sampler, and it is the dense
+/// end, not the sparse one** (`tau_split.rs`; the earlier rationale here named the 2-4 share rates and
+/// was measured against the broken feed). On a sustained 5 %/hr decline this value leaves every rate
+/// below the calibration rate settling in *under*-difficulty -- −12.49 % at 2 shares a minute, rising
+/// monotonically with rate to +1.90 % at 30 -- so the only cell on the over-difficulty side is the
+/// densest, and it is the first to cross the 5 % gate as `tau` grows, at 1080. On that decline every cell
+/// is inside the gate at 720, which read as about a factor of two of headroom above this value.
+///
+/// **That headroom is not there, and the corner that settles it is measured.**
+/// `wander::the_shallow_declines_memory_headroom_does_not_survive_a_steeper_one` runs the case where a
+/// sleepier memory and a deeper disturbance push the settled position the same way -- a 10 %/hr decline
+/// under hot wander. There this value holds every rate inside the gate (worst +2.62 % at 30 spm) and one
+/// step sleepier puts 30 spm outside it (+5.31 %). The steadiness gain that motivated raising it is
+/// sparse-only besides: under hot wander it vanishes at the dense end (0.97x at 12 spm, against 1.11x
+/// at 2). So the remaining live option is a `tau` split in the sparse band rather than a raise, which
+/// `tau_split.rs` notes is two lines and a calibration decision.
+///
+/// What is settled is that this value is not selected by the
+/// sparse rates, so an argument for moving it has to be made at the top of the band.
 pub(crate) const EWMA_TAU_SECS: u64 = 360;
 
 use super::{
@@ -373,10 +418,11 @@ pub struct VardiffState {
     ///
     /// [`MockClock`]: super::clock::MockClock
     clock: Arc<dyn Clock>,
-    /// The belief as of the last evaluation that saw shares, i.e. the last belief backed by
-    /// evidence. The ease is not allowed below `evidenced_hashrate / MAX_SILENT_DISPLACEMENT`.
-    /// `0.0` means "not yet anchored"; the first evaluation anchors it to the opening belief.
-    evidenced_hashrate: f32,
+    /// The declared hashrate the silence bound is anchored on: an evaluation that sees no shares may
+    /// not ease the belief below `declared_hashrate / MAX_SILENT_DISPLACEMENT`. `0.0` means "not yet
+    /// anchored"; the first evaluation anchors it to the opening belief, and only
+    /// [`VardiffState::redeclare_nominal`] moves it after that.
+    declared_hashrate: f32,
     /// Unix timestamp (seconds) of the last *evaluation*, as distinct from the last retarget.
     ///
     /// The estimator needs its own clock reference. `timestamp_of_last_update` advances only when
@@ -439,6 +485,14 @@ pub struct VardiffState {
     /// channels do not run at.
     #[cfg(test)]
     tau_override_secs: Option<u64>,
+    /// Test-only: `(split_rate, below, at_or_above)` -- two memories either side of an arbitrary rate.
+    ///
+    /// The split rate is a parameter rather than [`SPARSE_SPM_SEAM`] because the two are not the same
+    /// number: the seam is where the count-based bar stops dominating, and the rate where a sleepier memory
+    /// starts failing the decline gate is a different question. Takes precedence over
+    /// [`Self::tau_override_secs`], so a split arm is unambiguous.
+    #[cfg(test)]
+    tau_split_secs: Option<(f32, u64, u64)>,
 }
 
 impl VardiffState {
@@ -489,7 +543,7 @@ impl VardiffState {
             timestamp_of_last_update: timestamp_secs,
             min_allowed_hashrate,
             clock,
-            evidenced_hashrate: 0.0,
+            declared_hashrate: 0.0,
             timestamp_of_last_evaluation: timestamp_secs,
             last_direction: 0,
             last_fire_direction: 0,
@@ -504,7 +558,22 @@ impl VardiffState {
             window_cap_form: WindowCapForm::Shipped,
             #[cfg(test)]
             tau_override_secs: None,
+            #[cfg(test)]
+            tau_split_secs: None,
         })
+    }
+
+    /// Re-anchors the silence bound on a newly declared hashrate, such as the `nominal_hash_rate`
+    /// an `UpdateChannel` carries.
+    ///
+    /// This is the only way the anchor moves once the first evaluation has set it, so it is for an
+    /// explicit declaration and not for anything derived from shares. A value that is not a
+    /// positive, finite number is refused and the previous anchor stands: a proxy declares `0.0`
+    /// while no mining devices are connected, and an anchor of zero would bound nothing.
+    pub fn redeclare_nominal(&mut self, nominal_hash_rate: f32) {
+        if nominal_hash_rate.is_finite() && nominal_hash_rate > 0.0 {
+            self.declared_hashrate = nominal_hash_rate;
+        }
     }
 
     /// Test-only: switch the sparse arm to the validated champion's boundary.
@@ -532,6 +601,13 @@ impl VardiffState {
     #[cfg(test)]
     pub(crate) fn with_tau_secs(mut self, tau_secs: u64) -> Self {
         self.tau_override_secs = Some(tau_secs.max(1));
+        self
+    }
+
+    /// Test-only: run a different memory either side of `split_rate`.
+    #[cfg(test)]
+    pub(crate) fn with_tau_split(mut self, split_rate: f32, below: u64, at_or_above: u64) -> Self {
+        self.tau_split_secs = Some((split_rate, below.max(1), at_or_above.max(1)));
         self
     }
 
@@ -671,8 +747,8 @@ impl VardiffState {
     /// missed evaluation changes how much the filter forgets by the right amount instead of
     /// silently altering its memory. This is the same reason `tau` is parameterised in seconds
     /// rather than in evaluations.
-    fn ewma_alpha(&self, dt_secs: u64) -> f64 {
-        (-(dt_secs as f64) / (self.tau_secs() as f64)).exp()
+    fn ewma_alpha(&self, dt_secs: u64, shares_per_minute: f32) -> f64 {
+        (-(dt_secs as f64) / (self.tau_secs(shares_per_minute) as f64)).exp()
     }
 
     /// The estimator's time constant for this controller, in seconds.
@@ -680,11 +756,26 @@ impl VardiffState {
     /// [`EWMA_TAU_SECS`] in every build. A method rather than the constant read directly because the
     /// memory is the one parameter a test needs to vary: it is what `tau_split.rs` measures, and the
     /// figure that selects it is measured at rates most channels do not run at.
-    fn tau_secs(&self) -> u64 {
+    /// Takes the rate so a *split* is expressible: one memory below some rate and another at or above it.
+    ///
+    /// Both forms are now closed by measurement rather than merely unchosen. A uniform raise has no headroom,
+    /// and a split has nothing to select -- a sleepier memory worsens the over-difficulty excursion at every
+    /// rate, and worst in the sparse band a split would hand it to. See `tau_split.rs`.
+    fn tau_secs(&self, shares_per_minute: f32) -> u64 {
         #[cfg(test)]
-        if let Some(tau) = self.tau_override_secs {
-            return tau;
+        {
+            if let Some((split_rate, below, at_or_above)) = self.tau_split_secs {
+                return if shares_per_minute < split_rate {
+                    below
+                } else {
+                    at_or_above
+                };
+            }
+            if let Some(tau) = self.tau_override_secs {
+                return tau;
+            }
         }
+        let _ = shares_per_minute;
         EWMA_TAU_SECS
     }
 
@@ -718,7 +809,7 @@ impl VardiffState {
         // An unseeded EWMA takes the first observation whole; blending against a zero prior would
         // start every channel with a fictitious idle period.
         self.rate = if self.rate_seeded {
-            let alpha = self.ewma_alpha(dt_secs);
+            let alpha = self.ewma_alpha(dt_secs, shares_per_minute);
             alpha * self.rate + (1.0 - alpha) * observed_spm
         } else {
             observed_spm
@@ -858,8 +949,9 @@ impl VardiffState {
 
     /// Moves the belief part of the way to the estimate, further on each repeat in one direction.
     ///
-    /// Returns the new belief. Records the retarget's direction, so a run of same-direction moves
-    /// accelerates and a reversal starts over.
+    /// Returns the new belief. `fire_run` is the run this move would make, from
+    /// [`VardiffState::prospective_fire_run`], so a run of same-direction moves accelerates and a
+    /// reversal starts over.
     fn partial_retarget(&self, estimate: f32, current: f32, fire_run: u32) -> f32 {
         let step_fraction = (STEP_FRACTION_BASE
             + STEP_FRACTION_GROWTH * (fire_run.saturating_sub(1)) as f32)
@@ -886,10 +978,12 @@ impl VardiffState {
     }
 
     /// Records a retarget that reached the wire, advancing or restarting the run.
+    ///
+    /// The run is read before the direction is stored, because it is the comparison with the
+    /// previous retarget's direction that tells a continuation from a reversal.
     fn commit_fire(&mut self, tightening: bool) {
-        let direction: i8 = if tightening { 1 } else { -1 };
-        self.last_fire_direction = direction;
         self.consecutive_fires_same_direction = self.prospective_fire_run(tightening);
+        self.last_fire_direction = if tightening { 1 } else { -1 };
     }
 
     /// Rescales the EWMA after a retarget so its stored rate refers to the new difficulty.
@@ -1068,18 +1162,12 @@ impl Vardiff for VardiffState {
         let eval_dt = now.saturating_sub(self.timestamp_of_last_evaluation).max(1);
         self.timestamp_of_last_evaluation = now;
 
-        // Anchor the silence bound before the estimator consumes the pending count. Evidence
-        // re-anchors it to the belief that evidence was measured against; an unanchored channel
-        // anchors to its opening belief, so a channel that is silent from the start is bounded
-        // relative to where it started rather than being allowed to walk to the floor.
-        //
-        // The anchor is the belief *entering* this evaluation, not the one leaving it, so after a
-        // retarget the floor still refers to the previous belief and lags by one fire. Deliberate:
-        // it keeps the anchor to a value some evidence was actually measured against, where the
-        // post-retarget belief is a value the controller has only just proposed.
+        // Read the pending count before the estimator consumes it: the silence bound below applies
+        // only to an evaluation that saw no shares. An unanchored channel anchors to its opening
+        // belief, which for a channel opened at its declared rate is the declaration.
         let pending_shares = self.shares_since_last_update;
-        if pending_shares > 0 || self.evidenced_hashrate <= 0.0 {
-            self.evidenced_hashrate = hashrate;
+        if self.declared_hashrate <= 0.0 {
+            self.declared_hashrate = hashrate;
         }
 
         let (realized_share_per_min, estimated_hashrate) =
@@ -1206,13 +1294,15 @@ impl Vardiff for VardiffState {
         // on the decision, which is what makes the bound exact: a gate lets the step that crosses
         // it through, so the realized displacement depends on the step size, while a floor pins it
         // at `MAX_SILENT_DISPLACEMENT` for any estimator. Only downward movement is constrained,
-        // and only while `evidenced_hashrate` is stale — any share re-anchors it above.
-        if pending_shares == 0 && self.evidenced_hashrate > 0.0 {
-            let silent_floor = self.evidenced_hashrate / MAX_SILENT_DISPLACEMENT;
+        // and only on an evaluation that saw no shares. The floor is capped at the current belief,
+        // so a belief that evidence has taken below the bound is held rather than lifted to it.
+        if pending_shares == 0 && self.declared_hashrate > 0.0 {
+            let silent_floor = (self.declared_hashrate / MAX_SILENT_DISPLACEMENT).min(hashrate);
             if new_hashrate < silent_floor {
                 debug!(
                     target: "vardiff",
-                    "Ease bounded at {:.0}x below the last evidenced belief: {:.2} -> {:.2} H/s",
+                    "Ease bounded at {:.0}x below the declared hashrate, or at the current belief: \
+                     {:.2} -> {:.2} H/s",
                     MAX_SILENT_DISPLACEMENT,
                     new_hashrate,
                     silent_floor,

@@ -11,10 +11,12 @@
 //! shares a minute, because the dense bar decays as `1/window` while `sigma` falls only as `1/sqrt(r)` --
 //! so it costs exactly the retargets the cap exists to prevent.
 //!
-//! A second reason was recorded here and **has since been narrowed**. Capping the sparse window costs
-//! settled over-difficulty on a slow decline, which read as the seam gate being load-bearing; measured
-//! again with the miner's own rate wandering, that cost disappears (`wander.rs`). So it is a property of
-//! a perfectly steady miner, it is scoped that way below, and the rejection rests on the first reason.
+//! A second reason was recorded here and is now **withdrawn entirely**. Capping the sparse window appeared
+//! to cost `+3.27 pp` of settled over-difficulty, which read as the seam gate being load-bearing. Both that
+//! reading and the later "steady-miner only" narrowing were taken against a share feed that starved the
+//! sparse cells; repaired, the cap changes about one sparse trajectory in 25 and moves the median by a
+//! fraction of a point, because the inter-fire window seldom reaches the matched cap. The rejection rests
+//! on the crossing alone, which is unaffected.
 //!
 //! What survives is the residue: the shipped form, never looser than the matched window. It keeps the
 //! gate, so it cannot reintroduce the sparse failure, and it is a no-op above 8 shares a minute where the
@@ -24,7 +26,7 @@
 //! [`SPARSE_SPM_SEAM`]: crate::vardiff::classic::SPARSE_SPM_SEAM
 //! [`WINDOW_CAP_SECS`]: crate::vardiff::classic::WINDOW_CAP_SECS
 
-use super::trajectory::{constant, declining, measure_arm, Arm, Trial};
+use super::trajectory::{changed_against_shipped, constant, declining, measure_arm, Arm, Trial};
 use crate::vardiff::classic::VardiffState;
 
 const ONE_HOUR: u64 = 3600;
@@ -59,13 +61,21 @@ fn retargets_per_hour(trial: &Trial) -> f64 {
     trial.retargets as f64 / MEASURED_HOURS as f64
 }
 
+/// Trials for the stable-channel retarget counts.
+///
+/// The count is the median trial's, an integer over 12 h, and at 6 spm the two forms differ by three or four
+/// retargets. At 9 trials one of twelve independent seed sets ties them. At this count all twelve separate
+/// them, shipped `2.42-2.50` an hour against matched `2.17-2.25`, and at 12 spm shipped `0.83-0.92`
+/// against matched `1.08-1.17`.
+const STABLE_TRIALS: usize = 180;
+
 fn stable_at(spm: f32, arm: Arm) -> Trial {
     measure_arm(
         &constant(),
         spm,
         ONE_HOUR,
         MEASURED_HOURS * ONE_HOUR,
-        9,
+        STABLE_TRIALS,
         arm,
     )
 }
@@ -116,71 +126,68 @@ fn the_matched_rule_helps_below_the_crossing_and_hurts_above_it() {
     );
 }
 
-/// **Against a perfectly steady miner, capping the sparse window costs a slow decline at any cap.**
+/// **Capping the sparse window changes few trajectories, because the window seldom reaches the cap.**
 ///
-/// The research branch measured +29.9% settled over-difficulty from capping sparse windows at 900 s.
-/// Moving the cap out by an order of magnitude, to the 8600 s the estimator's spread asks for, does not
-/// remove the cost -- it attenuates it to **+3.27 pp** on the slow cell. The cell it hurts is the telling
-/// part: a 40 %/hr decline crosses any bar quickly and is unaffected, while the 5 %/hr decline, the one
-/// that needs the bar to keep falling over a long window, pays all of it.
+/// This recorded `+3.27 pp` of settled over-difficulty from capping a sparse window, which read as the seam
+/// gate being load-bearing, and a later pass narrowed it to "steady-miner only" after wander appeared to
+/// erase it. Both readings were taken against a share feed that suppressed zero-share ticks and, below one
+/// arrival a tick, delivered nothing at all -- so the sparse cells were being starved rather than capped.
 ///
-/// **Scoped to a steady miner deliberately, and that scope is the correction.** This was first recorded
-/// as the seam gate being load-bearing. Re-measured with the miner's own rate wandering at the worst
-/// values measured on hardware, the cost is -0.31 pp -- gone, because the shipped arm has itself degraded
-/// by more than the cap's effect. See `the_caps_sparse_cost_is_wander_free_but_its_crossing_cost_is_not`.
-/// The reading below is still worth keeping, because it is the one that isolates the cap's own effect from
-/// the disturbance; it is just not evidence about a deployment.
+/// Against the repaired feed the controller fires often enough that the inter-fire window seldom approaches
+/// the `sigma`-matched sparse cap of about 8600 s. Over [`CAP_TRIALS`] on the 5 %/hr decline the cap changes
+/// 19 trajectories at 2 spm and 1 at 4; on the 40 %/hr decline, 4 and none. Twelve independent samples of
+/// that many trials put the 2 spm counts at `9-19` and `1-7`, and the 4 spm counts at `0-2` and always
+/// none. So the median moves by a fraction of a point (`+0.06 pp` and `+0.13 pp` at 2 spm, `-0.07` to
+/// `+0.32` across the samples), and a median over a few dozen trials reads zero or not according to where
+/// the changed trajectories fall.
+///
+/// **Where the cap does act, it acts by several points**, mostly toward over-difficulty: the changed
+/// trajectories settle a median `+6.79 pp` higher at 5 %/hr, 12 of 19 of them higher, and `+10.64 pp` at
+/// 40 %/hr, all four higher. The cap is **rarely reached, not harmless** -- and the rate at which it is
+/// reached rises with anything that lengthens the sparse inter-fire interval.
+///
+/// The research branch's `+29.9%` figure for a 900 s sparse cap is not contradicted by this: 900 s is an
+/// order of magnitude tighter than the matched value and would be reached routinely. What is withdrawn is
+/// the claim about the *matched* cap.
 #[test]
-#[ignore = "numbers measured against the broken share sampler; needs re-derivation -- see VARDIFF.md, Retraction"]
-fn capping_the_sparse_window_costs_a_slow_decline_without_wander() {
-    const TRIALS: usize = 40;
-    /// What the slow cell pays, measured. Held as a range: a cost that has vanished means the sparse
-    /// branch changed and the seam gate may no longer be needed, which is worth failing over.
-    const SLOW_CELL_COST_PCT: (f64, f64) = (2.5, 4.0);
+fn the_sparse_window_cap_is_reached_rarely_rather_than_never() {
+    /// Enough that a cap reached on one trajectory in 25 is reached about 20 times.
+    const CAP_TRIALS: usize = 480;
 
-    let mut slow_cost = f64::NAN;
-    for spm in [2.0f32, 4.0] {
-        for (name, rate_pct_per_hr, drop) in [
-            ("5 %/hr losing 20%", 5.0, 0.20),
-            ("40 %/hr losing 50%", 40.0, 0.50),
-        ] {
-            let at = |arm| {
-                measure_arm(
-                    &declining(rate_pct_per_hr, drop),
-                    spm,
-                    ONE_HOUR,
-                    3 * ONE_HOUR,
-                    TRIALS,
-                    arm,
-                )
-            };
-            let shipped = at(Arm::Shipped);
-            let matched = at(Arm::SigmaMatchedCap);
-            let added = matched.final_error_pct - shipped.final_error_pct;
+    let mut reached = 0;
+    for (label, rate_pct_per_hr, drop) in [
+        ("5 %/hr losing 20%", 5.0, 0.20),
+        ("40 %/hr losing 50%", 40.0, 0.50),
+    ] {
+        for spm in [2.0f32, 4.0] {
+            let (changed, cost) = changed_against_shipped(
+                &declining(rate_pct_per_hr, drop),
+                spm,
+                ONE_HOUR,
+                3 * ONE_HOUR,
+                CAP_TRIALS,
+                Arm::SigmaMatchedCap,
+                None,
+            );
+            reached += changed;
 
             eprintln!(
-                "  [cap form] {spm} spm {name}: shipped settles {:+.2}%, matched {:+.2}% ({added:+.2} pp)",
-                shipped.final_error_pct, matched.final_error_pct
+                "  [cap form] {spm} spm {label}: the matched cap changes {changed} of {CAP_TRIALS} \
+                 trajectories and moves the median {cost:+.2} pp"
             );
             assert!(
-                added >= -0.01,
-                "capping the sparse window should never *help* a decline; at {spm} spm ({name}) it \
-                 moved settled error {added:+.2} pp, which contradicts the mechanism the seam gate is \
-                 justified by and means this test is measuring something else"
+                changed * 10 < CAP_TRIALS,
+                "the sigma-matched sparse cap should change few trajectories at {spm} spm ({label}): \
+                 {changed} of {CAP_TRIALS}. More means the inter-fire window routinely reaches ~8600 s, and \
+                 the question becomes whether the cap helps or strands a decline, which this test does not \
+                 answer"
             );
-            if spm == 2.0 && rate_pct_per_hr == 5.0 {
-                slow_cost = added;
-            }
         }
     }
-
-    let (lo, hi) = SLOW_CELL_COST_PCT;
     assert!(
-        slow_cost > lo && slow_cost < hi,
-        "the slow sparse cell paid {slow_cost:+.2} pp for a capped window, outside the measured \
-         {lo:.1}-{hi:.1} pp. Below the range, capping sparse has stopped costing anything and the seam \
-         gate may be removable; above it, the cost has grown and the 8600 s cap is further from safe \
-         than recorded"
+        reached > 0,
+        "and should change some: none of the trajectories reached it, which would restore the claim this \
+         test replaced, that the window never gets there"
     );
 }
 

@@ -66,15 +66,34 @@ fn the_two_arms_are_the_same_controller_above_the_seam() {
 /// Stated as a signed gap rather than as two absolute numbers, because the absolute settled position is
 /// already pinned by `the_absolute_settled_error_is_held_not_merely_the_relative_one`. What this adds is
 /// that the gap is real, has a sign, and is confined to where the branches differ.
+///
+/// **The gap spans zero at every cell measured**, which is a sharper fact than its width and the reason
+/// the calibration question above is worth deciding rather than filing. Shipped settles under at all four
+/// (`-20.02%`, `-11.51%`, `-14.95%`, `-8.53%`) and the champion over at all four (`+3.71%`, `+7.70%`,
+/// `+0.29%`, `+6.78%`). So the arms do not differ merely in how far from correct they rest -- they differ
+/// in **which failure mode they are exposed to**: the shipped arm pays submission load on the loud side,
+/// the champion carries over-difficulty on the blind one.
+///
+/// Read that precisely, though: the champion's constant-rate readings are inside the `5%` decline-safety
+/// gate and both its declining ones are outside it, so on a decline this is the champion stranding a
+/// miner. The two arms sit on opposite sides of correct, and the choice between them is a choice between
+/// a cost and a fault.
 #[test]
 fn the_shipped_sparse_arm_settles_below_the_champion_and_eases_more() {
     const TRIALS: usize = 40;
     /// The smallest settled gap that counts as the arms being materially different controllers. Below
     /// this the divergence would be cosmetic and could be left alone.
     ///
-    /// From measurement rather than choice: the gaps are `+7.08`, `+15.63`, `+12.12` and `+9.84` pp, so
-    /// `4.0` binds the narrowest cell at `1.8x`. Verified to bind by mutation -- `8.0` fails on the
-    /// `2 spm constant` cell.
+    /// The gaps are `+23.73` (2 spm constant), `+19.21` (2 spm declining), `+15.24` (4 spm constant)
+    /// and `+15.31` (4 spm declining) pp. Verified to bind by mutation: `15.3` fails on the
+    /// `4 spm constant` cell, which is the narrowest.
+    ///
+    /// Deliberately **not** tightened to the narrowest. This is a *materiality* floor, not a
+    /// regression bound: the two events it exists to catch are the gap closing -- the branches have
+    /// converged, and this test and its flag can go -- and the gap changing sign, meaning a mechanism
+    /// stopped reaching the sparse branch. Both are large and qualitative. A bound tracking the
+    /// measurement would also fire on ordinary narrowing, which is calibration drift this test has no
+    /// opinion about.
     const MIN_GAP_PCT: f64 = 4.0;
 
     let mut worst_gap = f64::MAX;

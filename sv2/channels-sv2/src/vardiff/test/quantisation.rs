@@ -1,7 +1,7 @@
 //! What a power-of-two egress costs at a settled point, as a bound rather than a reading.
 //!
 //! An 18-hour stall was measured on hardware: the belief settled below an octave boundary, the served
-//! difficulty stopped changing, and the miner delivered `2.36x` its target share rate indefinitely. That
+//! difficulty stopped changing, and the miner delivered `2.27x` its target share rate indefinitely. That
 //! is recorded elsewhere as a trajectory test -- a thing that passes. It is a *structural* claim, though,
 //! and structural claims admit a stronger treatment: prove the envelope, exhibit a witness inside it,
 //! report the gap. Borrowed from the BIP-54 chain-length work, which bounds an adversarial difficulty
@@ -30,13 +30,50 @@
 //!
 //! **And the bound is what prices the fix.** Exempting the tighten direction from the cap lets that bar
 //! keep decaying -- measured 48% at the 900 s cap, then 32, 24, 20, 18.4% at 12000 s, toward an asymptote
-//! of `MIN_THRESHOLD_FRACTION * MIN_EFFECTIVE_TIGHTEN_MULTIPLIER`. So the bound moves from `2.96x` to
-//! `2.32x`, and the pre-fix hardware witness at `2.36x` lands **outside** the post-fix bound, which is a
-//! quantitative statement that the measured stall is now unreachable.
+//! of `MIN_THRESHOLD_FRACTION * MIN_EFFECTIVE_TIGHTEN_MULTIPLIER`. So the bound moves from `2.96x` toward
+//! `2.32x`, and the pre-fix hardware witness at `2.36x` lands **outside** that asymptote. The measured stall
+//! is one the bar decays out of rather than one it cannot reach: at 12000 s the bar is still `18.4%` and the
+//! bound `2.37x`, so the stall is excluded only once the window has run longer than that, and only on the
+//! dense branch the witness was measured on (see the last section).
 //!
-//! What the fix cannot touch is the quantiser's factor of two. Post-fix that is `2/2.32 = 86%` of what
-//! remains, so the actuator does not merely dominate the controller -- it is very nearly all of it, and
-//! the rounding threshold is the only lever left with real leverage.
+//! What the fix cannot touch is the quantiser's factor of two. Post-fix that is `1.00` of the `1.32`
+//! excess over target, `76%`, against `0.16` for the controller and `0.16` for the two compounding -- so
+//! the actuator does not merely dominate the controller, it is most of the whole, and the rounding
+//! threshold is the only lever left with real leverage.
+//!
+//! # The post-fix state is now measured on hardware, and the bound holds
+//!
+//! The `2.36x` witness above is *pre-fix*. The cap exemption settled on the rig at 20:44:23Z on 2026-09-23
+//! and gives a post-fix witness:
+//!
+//! | | served | realized / target | decomposition |
+//! |---|---|---|---|
+//! | pre-fix | `32,768` | `2.36x` | `1.882x` quantiser x `1.237x` dead zone |
+//! | **post-fix** | `65,536` | **`1.164x`** | `~1.164x` quantiser x `~1.00x` dead zone |
+//!
+//! Two things follow, and the second is the more useful.
+//!
+//! **The bound is confirmed rather than merely unfalsified.** `1.164x` sits inside the post-fix `2.32x`, and
+//! the pre-fix `2.36x` sits *outside* it -- so the exemption moved the measured state across the boundary the
+//! bound predicts, in the direction and by more than the margin it predicts.
+//!
+//! **The quantiser is now essentially the whole residual, which is stronger than this file claimed.** The
+//! prose above says the quantiser is `76%` of the excess the bound leaves post-fix. Measured, the dead-zone
+//! factor has collapsed to about `1.00` and the excess is *all* actuator. An intended difficulty near `76,284`
+//! rounds down to `65,536`, which is `16.4%` of an octave -- so this witness is far from the quantiser's
+//! `2x` worst case and still accounts for the entire error. The rounding threshold is not merely the largest
+//! remaining lever; on this witness it is the only one.
+//!
+//! That is what makes the actuator experiment's restated `P1'` sharp: `1.164x -> 1.000x`, with nothing else
+//! left to attribute a miss to. See `actuator_granularity.rs`, premise check #5.
+//!
+//! **Every figure above is a dense-branch statement, which this file did not previously say.** The bar comes
+//! from [`tighten_bar_over`], whose evidence term is the dense branch; below the seam the controller uses a
+//! Poisson confidence interval instead, and the threshold in force there is measured at `161%` and `122%` at
+//! 1 and 2 spm against the `16%` asymptote used above. So the sparse bound is materially larger, the
+//! quantiser is a smaller share of it, and the actuator fix -- being linear in the quantum -- halves both ends
+//! without closing the gap between them. `the_shipped_bound_covers_the_dense_branch_only` names that gap; the
+//! sparse bound itself is underived, because a bound needs the bar's upper tail rather than its median.
 
 use super::{TEST_MIN_ALLOWED_HASHRATE, TEST_SHARES_PER_MINUTE};
 use crate::{
@@ -53,7 +90,7 @@ use crate::{
 use std::sync::Arc;
 
 /// The quantum a power-of-two egress imposes. Round-down, so the served difficulty is in `(D/2, D]`.
-const OCTAVE: f64 = 2.0;
+pub(super) const OCTAVE: f64 = 2.0;
 
 /// The hardware witness: the settled state measured on the candidate arm.
 ///
@@ -89,17 +126,17 @@ fn capped_tighten_bar(shares_per_minute: f64) -> f64 {
 /// and the evidence term decays to nothing.
 ///
 /// Rate-independent, because the evidence term is the only rate-dependent part and it vanishes.
-fn asymptotic_tighten_bar() -> f64 {
+pub(super) fn asymptotic_tighten_bar() -> f64 {
     MIN_THRESHOLD_FRACTION * MIN_EFFECTIVE_TIGHTEN_MULTIPLIER
 }
 
 /// Worst-case excess share rate at a settled point on a power-of-two egress, as a multiple of `r*`.
-fn over_delivery_bound(tighten_bar: f64) -> f64 {
+pub(super) fn over_delivery_bound(tighten_bar: f64) -> f64 {
     (1.0 + tighten_bar) * OCTAVE
 }
 
 /// Round a difficulty down to the largest power of two not exceeding it, as the SV1 egress does.
-fn round_down_pow2(difficulty: f64) -> f64 {
+pub(super) fn round_down_pow2(difficulty: f64) -> f64 {
     assert!(difficulty >= 1.0, "difficulty below 1 has no octave");
     (difficulty.log2().floor()).exp2()
 }
@@ -344,7 +381,7 @@ fn the_tighten_exemption_tightens_the_bound_past_the_measured_stall() {
     assert!(
         measured > post,
         "and the pre-fix witness must fall OUTSIDE the post-fix bound -- that is the quantitative form of \
-         'the measured stall is now unreachable'. Witness {measured:.2}x against a bound of {post:.2}x"
+         'the bar decays out of the measured stall'. Witness {measured:.2}x against a bound of {post:.2}x"
     );
     assert!(
         measured < pre,
@@ -376,5 +413,103 @@ fn the_quantiser_is_most_of_the_remaining_bound() {
         "the quantiser should be over 80% of the post-fix bound; it is {:.0}%. If the controller's share \
          has grown back, the exemption has been weakened and the priority between the two levers changes",
         quantiser_share * 100.0
+    );
+}
+
+/// **The `2.32x` bound is a dense-branch statement, and the sparse branch is outside its derivation.**
+///
+/// A coverage gap named rather than papered over. Every bar in this file comes from
+/// [`tighten_bar_over`], whose evidence term is the *dense* branch -- and that term scales as
+/// `sqrt(spm / REFERENCE_SPM)`, so it **rises** with rate. Below [`SPARSE_SPM_SEAM`] the controller does not
+/// use that term at all; it uses a Poisson confidence interval, which falls as `1/sqrt(N)` and is far wider.
+/// So the asymptotic `16%` bar and the `2.32x` bound built on it describe a dense channel, and this file
+/// never said so.
+///
+/// Measured from the controller itself rather than re-derived, since re-deriving the sparse branch here would
+/// duplicate the implementation this suite exists to check:
+///
+/// | spm | branch | threshold in force | bound `(1 + bar) * 2` |
+/// |---|---|---|---|
+/// | 1 | sparse | `~161 %` | `~5.2x` |
+/// | 2 | sparse | `~122 %` | `~4.4x` |
+/// | 4 | sparse | `~75 %` | `~3.5x` |
+/// | 30 | dense | `~34 %` | `~2.7x` |
+/// | asymptote | dense | `16 %` | `2.32x` |
+///
+/// The `122 %` at 2 spm is of a size with the `112.84 %` dead zone recorded in `VARDIFF.md`, which was
+/// measured a different way -- so the sparse bar being several times the asymptote is not an artefact of
+/// this reading.
+///
+/// **What this does not license is quoting a sparse bound.** The figures above are medians of the threshold in
+/// force, and a bound needs the bar's upper tail; substituting a median into a worst-case product gives a
+/// number that is neither. The assertion below is therefore the *gap*, not a value: the sparse threshold
+/// materially exceeds the bar the shipped bound is built on, so a sparse bound exists, is larger, and is
+/// underived. Direction-mixing works in favour of the claim -- an ease threshold is smaller than a tighten
+/// one, so a sparse reading near `100 %` is a conservative floor.
+///
+/// This also reorders the fine-actuator experiment's reach. `over_delivery_bound` is linear in the quantum, so
+/// removing it halves the bound at every rate -- leaving the dense end near `1.16x` and the sparse end near
+/// half of whatever its bound turns out to be. The fix does not close the sparse/dense gap; it preserves it.
+///
+/// [`SPARSE_SPM_SEAM`]: crate::vardiff::classic
+#[test]
+fn the_shipped_bound_covers_the_dense_branch_only() {
+    use super::trajectory::{measure_arm, mis_declared, Arm};
+
+    /// Trials per cell. The threshold in force is far better resolved than an error reading, but this is a
+    /// claim about magnitude against a fixed number, so it is powered deliberately.
+    const TRIALS: usize = 200;
+    /// Least multiple of the asymptotic bar the sparse threshold must reach for the gap to be real rather
+    /// than a reading. Measured about `10.1x` at 1 spm and `7.7x` at 2.
+    const MIN_SPARSE_MULTIPLE: f64 = 3.0;
+
+    let bar_at = |spm: f32| {
+        measure_arm(
+            &mis_declared(3.0),
+            spm,
+            3600,
+            6 * 3600,
+            TRIALS,
+            Arm::Shipped,
+        )
+        .final_threshold_pct
+            / 100.0
+    };
+
+    let asymptote = asymptotic_tighten_bar();
+    for spm in [1.0f32, 2.0] {
+        let bar = bar_at(spm);
+        eprintln!(
+            "  [quantisation] {spm} spm is on the sparse branch: threshold {:.1}% against the {:.1}% \
+             asymptote the bound uses, so the bound there is about {:.1}x rather than {:.2}x",
+            bar * 100.0,
+            asymptote * 100.0,
+            over_delivery_bound(bar),
+            over_delivery_bound(asymptote)
+        );
+        assert!(
+            bar > asymptote * MIN_SPARSE_MULTIPLE,
+            "the sparse threshold should be several times the asymptotic bar the shipped bound is built on, \
+             which is what makes the bound a dense-branch statement: {:.1}% against {:.1}% at {spm} spm. If \
+             these ever converge the two branches have stopped differing and the bound covers the whole band",
+            bar * 100.0,
+            asymptote * 100.0
+        );
+    }
+
+    // And the dense end is close to the asymptote, which is what makes the shipped figure the dense one.
+    let dense = bar_at(30.0);
+    eprintln!(
+        "  [quantisation] 30 spm is on the dense branch: threshold {:.1}%, within reach of the {:.1}% \
+         asymptote",
+        dense * 100.0,
+        asymptote * 100.0
+    );
+    assert!(
+        dense < bar_at(2.0),
+        "and the dense threshold must be the narrower of the two, or the branches are the wrong way round: \
+         {:.1}% at 30 spm against {:.1}% at 2",
+        dense * 100.0,
+        bar_at(2.0) * 100.0
     );
 }
