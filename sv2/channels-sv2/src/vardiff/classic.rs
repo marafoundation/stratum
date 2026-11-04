@@ -360,6 +360,14 @@ const NOMINAL_TICK_SECS: u64 = 60;
 /// sparse rates, so an argument for moving it has to be made at the top of the band.
 pub(crate) const EWMA_TAU_SECS: u64 = 360;
 
+/// Memory of the share-count dispersion estimate, in seconds.
+///
+/// The dense bar is scaled by the estimate's own spread and widened by the measured dispersion of
+/// the counts (see [`VardiffState::dense_threshold_dispersed`]). Dispersion is a property of how a
+/// miner and its path deliver shares, which changes slowly, so it is averaged over five of the
+/// estimator's memories.
+pub(crate) const DISPERSION_TAU_SECS: f64 = 1800.0;
+
 use super::{
     clock::{Clock, SystemClock},
     error::VardiffError,
@@ -451,6 +459,13 @@ pub struct VardiffState {
     /// whole rather than blending it against a zero prior, which would start every channel with a
     /// fictitious idle period.
     rate_seeded: bool,
+    /// Measured dispersion of the per-evaluation share counts: an EWMA of
+    /// `(n_k - n_{k-1})^2 / (n_k + n_{k-1})` over consecutive counts, which reads 1 for Poisson
+    /// arrivals and more when shares arrive in clusters. Consecutive differences count a change in
+    /// level once, rather than as dispersion. Starts at 1.
+    dispersion: f64,
+    /// The previous evaluation's share count, for [`VardiffState::dispersion`].
+    previous_pending_shares: Option<u32>,
     /// The decision threshold used by the most recent evaluation, in percent, or `None` before the
     /// first one.
     ///
@@ -551,6 +566,8 @@ impl VardiffState {
             consecutive_same_direction: 0,
             rate: 0.0,
             rate_seeded: false,
+            dispersion: 1.0,
+            previous_pending_shares: None,
             last_threshold_pct: None,
             #[cfg(test)]
             champion_sparse_boundary: false,
@@ -876,7 +893,7 @@ impl VardiffState {
         let base = if sparse {
             Self::sparse_threshold(dt_secs, shares_per_minute)
         } else {
-            Self::dense_threshold(dt_secs, shares_per_minute)
+            Self::dense_threshold_dispersed(dt_secs, shares_per_minute, self.dispersion)
         };
 
         // The champion's sparse arm stops here: a bare, symmetric Poisson interval, with neither the
@@ -945,6 +962,28 @@ impl VardiffState {
         }
         let spm_factor = (shares_per_minute as f64 / REFERENCE_SPM).sqrt();
         (EVIDENCE_AT_ONE_MINUTE * spm_factor / window_minutes + MIN_THRESHOLD_FRACTION) * 100.0
+    }
+
+    /// Dense branch with the requirement scaled by the estimate's spread and widened by dispersion.
+    ///
+    /// [`VardiffState::dense_threshold`] scales its one-minute requirement by
+    /// `sqrt(spm / REFERENCE_SPM)`, which rises with the share rate. That is not what counting noise
+    /// asks for, whose relative spread falls as `1/sqrt(spm)`; what the rising factor buys is quiet
+    /// when shares arrive in clusters at high rates. This states that margin instead: the
+    /// requirement follows the estimate's spread, `sqrt(SEAM / spm)` calibrated at the seam, times
+    /// `sqrt(max(1, dispersion))`, and is never larger than [`VardiffState::dense_threshold`]'s.
+    /// At and below the seam the two are equal.
+    fn dense_threshold_dispersed(dt_secs: u64, shares_per_minute: f32, dispersion: f64) -> f64 {
+        let window_minutes = dt_secs as f64 / 60.0;
+        if window_minutes <= 0.0 {
+            return f64::INFINITY;
+        }
+        let spm = shares_per_minute as f64;
+        let seam = SPARSE_SPM_SEAM as f64;
+        let deployed = EVIDENCE_AT_ONE_MINUTE * (spm / REFERENCE_SPM).sqrt();
+        let spread = EVIDENCE_AT_ONE_MINUTE * (seam / REFERENCE_SPM).sqrt() * (seam / spm).sqrt();
+        let k = (spread * dispersion.max(1.0).sqrt()).min(deployed);
+        (k / window_minutes + MIN_THRESHOLD_FRACTION) * 100.0
     }
 
     /// Moves the belief part of the way to the estimate, further on each repeat in one direction.
@@ -1048,6 +1087,9 @@ impl Vardiff for VardiffState {
         self.rate = 0.0;
         self.rate_seeded = false;
         self.timestamp_of_last_evaluation = timestamp_secs;
+        // The dispersion estimate starts over with the rest of the evidence.
+        self.dispersion = 1.0;
+        self.previous_pending_shares = None;
         // Also clear both same-direction runs. A stale count would carry its accumulated discount
         // into the next cycle and lower the bar on evidence that no longer exists — and because the
         // discount applies to tightening too, it would erode the very reluctance the asymmetry
@@ -1166,6 +1208,15 @@ impl Vardiff for VardiffState {
         // only to an evaluation that saw no shares. An unanchored channel anchors to its opening
         // belief, which for a channel opened at its declared rate is the declaration.
         let pending_shares = self.shares_since_last_update;
+        if let Some(previous) = self.previous_pending_shares {
+            let (n, p) = (pending_shares as f64, previous as f64);
+            if n + p > 0.0 {
+                let alpha = (-(eval_dt as f64) / DISPERSION_TAU_SECS).exp();
+                let d = n - p;
+                self.dispersion = alpha * self.dispersion + (1.0 - alpha) * (d * d / (n + p));
+            }
+        }
+        self.previous_pending_shares = Some(pending_shares);
         if self.declared_hashrate <= 0.0 {
             self.declared_hashrate = hashrate;
         }
