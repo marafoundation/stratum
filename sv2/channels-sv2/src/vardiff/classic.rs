@@ -364,7 +364,9 @@ const NOMINAL_TICK_SECS: u64 = 60;
 /// rate, so the settled gate no longer selects this value. Response does: simulated on a full share stack,
 /// a 720 s memory answers a 3x rise 16 to 88 minutes later than this one and a halving 19 to 41 minutes
 /// later, at 2 to 30 shares a minute, for a steadier belief. The tests that carried the old reason are
-/// ignored pending a re-derivation on that axis (`tau_split.rs`, `wander.rs`).
+/// ignored, and `tau_split::a_sleepier_memory_costs_response_at_every_rate` holds the new one: in this
+/// crate's harness one step sleepier delays every first passage after a 3x rise or a halving by 14 to 27
+/// evaluations, and the rise at 2 shares a minute by more than six hours.
 pub(crate) const EWMA_TAU_SECS: u64 = 360;
 
 /// Memory of the share-count dispersion estimate, in seconds.

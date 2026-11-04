@@ -5,8 +5,10 @@
 //! the readings in this file are of the previous dense bar, and the tests that assert the dense cell sits
 //! over-difficulty are ignored with that reason rather than recalibrated. What holds the memory at 360 s
 //! under the new bar is response, not the settled gate: simulated on a full share stack, a 720 s memory
-//! answers rises, halvings and false declarations far more slowly at every rate. No test here measures
-//! that yet; it is the re-derivation outstanding.
+//! answers rises, halvings and false declarations far more slowly at every rate.
+//! `tau_split::a_sleepier_memory_costs_response_at_every_rate` measures the first two in this harness:
+//! one step sleepier delays every first passage by 14 to 27 evaluations, and a 3x rise at 2 spm by more
+//! than the six measured hours.
 //!
 //! Whether the estimator's memory is chosen by the rates most channels run at, and what the rest pay.
 //!
@@ -133,7 +135,9 @@
 //!
 //! [`EWMA_TAU_SECS`]: crate::vardiff::classic::EWMA_TAU_SECS
 
-use super::trajectory::{constant, declining, measure_arm, measure_arm_wander, Arm, Trial, Wander};
+use super::trajectory::{
+    constant, declining, measure_arm, measure_arm_wander, Arm, Trial, Wander, START_HASHRATE,
+};
 
 const ONE_HOUR: u64 = 3600;
 const MEASURED_HOURS: u64 = 12;
@@ -689,5 +693,73 @@ fn on_a_steady_miner_the_gate_holds_by_under_half_a_point() {
              {MAX_MARGIN_PCT} points on a steady miner: it read {powered:+.2}% at {MARGIN_TRIALS} trials. \
              VARDIFF.md quotes this margin for both the shipped memory and the split"
         );
+    }
+}
+
+/// Trials for the response readings: each is a median of first-passage ticks, which is coarser than a
+/// settled reading, so fewer trials resolve it.
+const RESPONSE_TRIALS: usize = 200;
+
+/// A miner steady for the warm-up hour that then steps to `factor` times its rate and stays there.
+fn stepping(factor: f64) -> impl Fn(u64) -> f64 {
+    move |elapsed| START_HASHRATE as f64 * if elapsed > ONE_HOUR { factor } else { 1.0 }
+}
+
+/// Median evaluations from a step until the belief is within 10% of the truth or crosses it.
+fn ticks_after_step(spm: f32, factor: f64, arm: Arm) -> usize {
+    measure_arm(
+        &stepping(factor),
+        spm,
+        ONE_HOUR,
+        6 * ONE_HOUR,
+        RESPONSE_TRIALS,
+        arm,
+    )
+    .ticks_to_converge
+    .expect("measure_arm always reports a median")
+}
+
+/// **What holds the memory at 360 s under the dispersion-scaled dense bar: response.**
+///
+/// The ignored tests above held it by the settled gate, which no longer binds. What does is how long a
+/// sleepier estimator takes to believe a change: a step in hashrate reaches the belief only as fast as the
+/// EWMA forgets, so one step sleepier delays every first passage. Measured on a 3x rise and a halving at
+/// both ends of the band and the seam, against the steadiness gain
+/// `that_refusal_costs_both_ends_of_the_band_steadiness` measures, which is the other side of the trade.
+///
+/// Median first passage in evaluations, 360 s against 720 s, at [`RESPONSE_TRIALS`]: a 3x rise takes 231
+/// against more than the six measured hours at 2 spm, 45 against 72 at 6 and 45 against 63 at 30; a halving
+/// 34 against 58, 20 against 34 and 18 against 33. The smallest gap is 14 evaluations, so the bound below
+/// holds with headroom in every cell.
+#[test]
+fn a_sleepier_memory_costs_response_at_every_rate() {
+    /// Least delay, in evaluations, that one step sleepier must add to every first passage.
+    const MIN_DELAY_TICKS: usize = 8;
+    let shown = |t: usize| {
+        if t >= (6 * ONE_HOUR / 60) as usize {
+            "not within 6 h".to_string()
+        } else {
+            format!("{t}")
+        }
+    };
+    for spm in [2.0f32, 6.0, DENSE_SPM] {
+        for (name, factor) in [("3x rise", 3.0), ("halving", 0.5)] {
+            let (shipped, sleepier) = (
+                ticks_after_step(spm, factor, SHIPPED),
+                ticks_after_step(spm, factor, SLEEPIER),
+            );
+            eprintln!(
+                "  [tau] {spm:.0} spm {name}: median first passage {} evaluations at 360 s, {} at 720 s",
+                shown(shipped),
+                shown(sleepier)
+            );
+            assert!(
+                sleepier >= shipped.saturating_add(MIN_DELAY_TICKS),
+                "one step sleepier should answer a {name} at {spm:.0} spm at least {MIN_DELAY_TICKS} \
+                 evaluations later than the shipped memory: {} against {}",
+                shown(sleepier),
+                shown(shipped)
+            );
+        }
     }
 }

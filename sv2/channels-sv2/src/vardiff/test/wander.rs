@@ -5,8 +5,10 @@
 //! the readings in this file are of the previous dense bar, and the tests that assert the dense cell sits
 //! over-difficulty are ignored with that reason rather than recalibrated. What holds the memory at 360 s
 //! under the new bar is response, not the settled gate: simulated on a full share stack, a 720 s memory
-//! answers rises, halvings and false declarations far more slowly at every rate. No test here measures
-//! that yet; it is the re-derivation outstanding.
+//! answers rises, halvings and false declarations far more slowly at every rate.
+//! `tau_split::a_sleepier_memory_costs_response_at_every_rate` measures the first two in this harness:
+//! one step sleepier delays every first passage by 14 to 27 evaluations, and a 3x rise at 2 spm by more
+//! than the six measured hours.
 //!
 //! What the measurements look like once the miner's own rate is allowed to wander.
 //!
