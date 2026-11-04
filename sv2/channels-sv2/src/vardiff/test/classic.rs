@@ -552,10 +552,13 @@ fn test_tightening_needs_more_evidence_than_loosening() {
         "tightening should need the longer observation: tighten at {tighten_window}s, \
          loosen at {loosen_window}s"
     );
+    // Re-measured when the dense bar moved to the estimate's spread (`dense_threshold_dispersed`): at
+    // this file's 10 shares a minute its one-minute requirement is 0.52 against the previous 0.87, so both
+    // windows shorten and the asymmetry survives. The previous pin was (945, 68).
     assert_eq!(
         (tighten_window, loosen_window),
-        (945, 68),
-        "the asymmetry delays action on an 83% over-delivery from 68s to 945s; a change here is \
+        (568, 40),
+        "the asymmetry delays action on an 83% over-delivery from 40s to 568s; a change here is \
          a change in that cost"
     );
 }
@@ -675,8 +678,9 @@ fn test_same_direction_run_accumulates_resets_and_clears() {
 ///
 /// This band is where the controller's settled offset lives, and the offset is inside it at every rate
 /// measured -- `0.206` of the threshold in force at worst (6 shares a minute), and `19.35%`
-/// at worst in percent (2 shares a minute, against a `116%` bar), against the `42%` tightening bar this
-/// test pins. That offset is deliberate
+/// at worst in percent (2 shares a minute, against a `116%` bar), against the `41%` tightening bar this
+/// test pins (`42%` before the dense bar moved to the estimate's spread, whose evidence term at ten hours is
+/// smaller). That offset is deliberate
 /// rather than an error: a difficulty settling slightly easy rather than exactly on target keeps the
 /// miner's own share-rate excursions inside a band it tolerates, where a difficulty settled exactly on
 /// target would let the upper excursions cross the point at which a rate-switching miner disconnects.
@@ -735,7 +739,7 @@ fn test_asymmetry_leaves_a_dead_zone_of_uncorrected_over_delivery() {
     );
     assert_eq!(
         (loosen, tighten),
-        (6, 42),
+        (6, 41),
         "the dead zone is a product of MIN_THRESHOLD_FRACTION and TIGHTEN_MULTIPLIER; a change \
          here moves the settled offset with it"
     );
@@ -773,11 +777,14 @@ fn test_the_discount_brings_a_persistent_deviation_forward() {
         }
     }
 
+    // Re-measured when the dense bar moved to the estimate's spread (`dense_threshold_dispersed`): the
+    // lower bar brings both indices forward, 6 and 8 becoming 4 and 5, and the discount still moves the
+    // decision by one evaluation.
     assert_eq!(
         first_fire,
-        Some(6),
-        "a persistent 40% shortfall should first retarget at evaluation 6; without the run discount \
-         the same deviation waits until 8"
+        Some(4),
+        "a persistent 40% shortfall should first retarget at evaluation 4; without the run discount \
+         the same deviation waits until 5"
     );
 }
 

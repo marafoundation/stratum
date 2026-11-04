@@ -358,6 +358,13 @@ const NOMINAL_TICK_SECS: u64 = 60;
 ///
 /// What is settled is that this value is not selected by the
 /// sparse rates, so an argument for moving it has to be made at the top of the band.
+///
+/// **Under the dispersion-scaled dense bar the reason above no longer binds, and a different one does.**
+/// That bar settles the dense cells under-difficulty, and one step sleepier stays inside the gate at every
+/// rate, so the settled gate no longer selects this value. Response does: simulated on a full share stack,
+/// a 720 s memory answers a 3x rise 16 to 88 minutes later than this one and a halving 19 to 41 minutes
+/// later, at 2 to 30 shares a minute, for a steadier belief. The tests that carried the old reason are
+/// ignored pending a re-derivation on that axis (`tau_split.rs`, `wander.rs`).
 pub(crate) const EWMA_TAU_SECS: u64 = 360;
 
 /// Memory of the share-count dispersion estimate, in seconds.
