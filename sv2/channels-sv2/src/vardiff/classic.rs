@@ -202,10 +202,29 @@ pub(crate) const STEP_FRACTION_GROWTH: f32 = 0.05;
 
 /// Ceiling on the fraction a single retarget may close.
 ///
-/// Defensive rather than load-bearing: it takes nine consecutive same-direction retargets to reach,
-/// and the longest run observed in a measured `3x` step response was six, so in that scenario the
-/// ceiling never binds and the effective range is `0.2` to `0.45`.
+/// It takes nine consecutive same-direction retargets to reach, and the longest run observed in a measured
+/// `3x` step response was six, so in that scenario the ceiling never binds and the effective range is
+/// `0.2` to `0.45`.
+///
+/// It is load-bearing all the same, as a stability bound. Shares a miner found at the previous difficulty
+/// and read against the new target close a loop around the step: a fraction `delta` of a tick's shares
+/// late adds `delta (b_k - b_(k-1))` to the observation. The gate, the run discount, the step growth and the
+/// step bound together are a time-varying gain in `[0, STEP_FRACTION_MAX]` on that loop, and the circle
+/// criterion rules out a sustained oscillation for any such gain below `2 / (1 + 2 delta)`. `delta` is at
+/// most 1, a full tick of late shares, which gives `2/3`
+/// (`relations.rs::the_step_ceiling_keeps_the_late_share_loop_from_ringing`, and a compile-time assertion
+/// below). The margin is a tenth. On a simulated loop with every share late, a fixed step only starts to
+/// alternate from about 1.5, so the bound is conservative, but above `2/3` it no longer guarantees anything.
 pub(crate) const STEP_FRACTION_MAX: f32 = 0.6;
+
+// Late shares close a loop around the step (see STEP_FRACTION_MAX's doc), and the circle criterion rules
+// out a sustained oscillation of it only for a step ceiling under 2 / (1 + 2 delta), 2/3 at delta = 1.
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(
+    STEP_FRACTION_MAX < 2.0 / 3.0,
+    "STEP_FRACTION_MAX is at or above 2/3, where the circle criterion no longer rules out a sustained \
+     oscillation of the loop late shares close around the step"
+);
 
 /// Consecutive same-direction retargets at which the step fraction reaches [`STEP_FRACTION_MAX`].
 ///

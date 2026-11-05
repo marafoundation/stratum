@@ -337,6 +337,7 @@ reachable rate puts the dense branch on sparse data, which is worse than the hon
 | disturbance | what happens | where |
 |---|---|---|
 | **sustained decline** | acted on at every rate; on the grid, ends the ramp within 5% over (`+4.57%`, 30 spm, 10 %/hr) and 23.7% under; past the gate above 30 spm | `regimes.rs`, `tau_split.rs` |
+| **steady rise** | followed behind the tighten bar: a 12.7 %/hr rise, 21 evaluations behind at 6 spm and 50 at 30 with Poisson shares (the belief 4% and 10% under), against the 10.5 a step of 0.2 and the EWMA alone would give | `regimes.rs` |
 | **single outage** | eased to the 9× displacement bound and stops there, at every rate; the bound is anchored on the declared hashrate, so it holds across repeated outages, not only within one | `regimes.rs` |
 | **steady channel** | ≤4 retargets an hour, standing offset within 25% | `regimes.rs` |
 | **swing above `τ`** | read less accurately at 2.5τ than at 20τ — the long flank only; `regimes.rs` does not bracket the memory | `regimes.rs` |
@@ -418,6 +419,17 @@ served) against the controller's `1.237x` (truth over belief), and their product
 count to 1.4% (`quantisation.rs::the_measured_stall_sits_inside_the_bound_and_decomposes`). On a
 quantised egress most of the excess is the actuator.
 
+**Why it parks rather than hunts: the controller is handed the target the miner was sent.** The translator
+validates shares against the rounded target it advertised, and hands that target to `try_vardiff` with the
+unrounded belief (sv2-apps `67d87bb5`, 2026-07-20), so the estimate reads the truth and the rounding shows up
+only as the standing `D_intended / D_served` above. Handed the target for its unrounded belief instead, the
+controller would read `H / D_served` below an octave boundary and half that above it. Whenever both sides
+clear their bars, it is driven back across the boundary: a limit cycle of the gate, 3.4 to 5.3 reversals an
+hour mid-octave at 6 and 30 spm on a noise-free loop, against none with the served target. Below about 15%
+above a power of two, the tighten bar absorbs it and the belief parks an octave down
+(`quantisation.rs::the_served_target_is_what_keeps_a_quantised_egress_from_hunting`). So which target a caller
+hands the controller is part of the quantiser's contract, though nothing in the signature enforces it.
+
 
 ### A channel that flaps sits persistently under-difficulty
 
@@ -466,6 +478,14 @@ Four of the nineteen are determined by others. Two are enforced at compile time;
   sensitivity at every rate.
 - `SPARSE_SPM_SEAM` and `WINDOW_CAP_SECS` answer one question and disagree (§3).
 
+One more is bounded by a loop rather than by another constant: `STEP_FRACTION_MAX` must stay under `2/3`.
+Shares a miner found at the previous difficulty and read against the new target close a loop around the
+step, and the gate, the run discount, the step growth and the step bound are one time-varying gain on it,
+in `[0, STEP_FRACTION_MAX]`. The circle criterion rules out a sustained oscillation for any such gain
+below `2 / (1 + 2 delta)`, with `delta` the late fraction of a tick: `2/3` at `delta = 1`. That's a
+compile-time assertion, with a margin of a tenth, and with every share late the controller reverses only
+where its disturbances force it to (`relations.rs::the_step_ceiling_keeps_the_late_share_loop_from_ringing`).
+
 A recurring shape worth naming: `WINDOW_CAP_SECS`, `MAX_SILENT_DISPLACEMENT` and the seam are all
 rate-flat constants standing in for rate-dependent quantities. `MAX_SILENT_DISPLACEMENT` in
 particular bounds a *ratio* where its own rationale is about a share *flood* — the same 9× permits
@@ -485,6 +505,13 @@ minimum hashrate, so a miner running at twice that minimum can be eased to 18× 
   all, and `wander.rs::wander_pulls_back_the_cells_that_sit_over_difficulty` records that wander is now
   **protective** with respect to the over-difficulty gate — so a steady-miner reading is the conservative
   one, which is the reverse of what this section used to warn about.)*
+- **The estimate is quantised by its own conversion.** `hash_rate_from_target` truncates the mean share
+  interval to 0.01 s, so the estimate moves in relative steps of `1 / floor(6000 / spm)` and reads high by
+  about half a step: 0.25% at 30 spm, 1% at 120, 2% at 240 and 5% at 600
+  (`instruments.rs::the_estimate_is_quantised_by_the_interval_truncation`). At the 2–30 spm this document is
+  measured at, that's a standing offset under 0.5%. Simulated on an exact replica, it begins to slow the
+  response from about 240 spm and doubles the lag behind a ramp at 600. So nothing here should be read
+  above about 120 spm without re-measuring.
 - **Statistical power.** Mostly 20–400 trials on 4–12 hour runs, medians, and 12,800 where a margin is
   under half a point. Figures are quoted to three
   significant digits; the tests assert robust inequalities instead, and those are what to rely on.
@@ -505,7 +532,7 @@ minimum hashrate, so a miner running at twice that minimum can be eased to 18× 
   run a memory chosen to keep sparse ones safe" — measured when the share feed starved the sparse cells.
   The inversion holds under the worst measured wander too: at 720 s, 2 spm reads −4.74% and 30 spm
   +0.60%.)*
-- **No second disturbance shape** beyond those above: no ramp, no partial recovery, no
+- **No second disturbance shape** beyond those above and a steady rise (§4): no partial recovery, no
   correlated fleet-wide event. The last is the one that matters, because it is also what sets the
   aggregate noise floor the second archive is needed for.
 

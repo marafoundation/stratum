@@ -513,3 +513,91 @@ fn the_shipped_bound_covers_the_dense_branch_only() {
         bar_at(2.0) * 100.0
     );
 }
+
+/// One deterministic closed loop on a power-of-two egress, in the topology
+/// `regimes.rs::the_quantised_path_crosses_the_octave_boundary` models: the miner hashes at the rounded
+/// difficulty and the controller holds its unrounded belief. `served_target` chooses which target the
+/// controller is handed: the rounded one the miner was sent (`true`), or the one for its unrounded belief.
+/// Each tick delivers its expected share count, the remainder carried to the next, so whatever cycles is
+/// the loop's own and not noise. Returns reversals an hour after a four-hour warm-up, and the fraction of
+/// that time served above the truth.
+fn quantised_loop(truth_over_octave: f64, spm: f32, served_target: bool) -> (f64, f64) {
+    const TICK_SECS: u64 = 60;
+    const WARM_UP: u64 = 240;
+    const EVALUATIONS: u64 = 48 * 60;
+    let unit = spm as f64 / 60.0 * 2f64.powi(32);
+    let truth = truth_over_octave * 2f64.powi(20) * unit;
+    let clock = Arc::new(MockClock::new(1_000_000));
+    let mut vardiff = VardiffState::new_with_clock(1.0, clock.clone()).expect("constructs");
+    let mut belief = truth as f32;
+    let (mut carry, mut reversals, mut above, mut last) = (0.0f64, 0u32, 0u64, 0i8);
+    for k in 0..EVALUATIONS {
+        let served = round_down_pow2(belief as f64 / unit) * unit;
+        carry += spm as f64 * truth / served * (TICK_SECS as f64 / 60.0);
+        let n = carry.floor();
+        carry -= n;
+        clock.advance(TICK_SECS);
+        for _ in 0..n as u64 {
+            vardiff.increment_shares_since_last_update();
+        }
+        let handed = if served_target { served } else { belief as f64 };
+        let target = hash_rate_to_target(handed, spm as f64).expect("positive inputs convert");
+        if let Ok(Some(next)) = vardiff.try_vardiff(belief, &target, spm) {
+            if k >= WARM_UP {
+                let direction = if next > belief { 1 } else { -1 };
+                reversals += (last != 0 && direction != last) as u32;
+                last = direction;
+            }
+            belief = next;
+        }
+        above += (k >= WARM_UP && served > truth) as u64;
+    }
+    let hours = (EVALUATIONS - WARM_UP) as f64 / 60.0;
+    (
+        reversals as f64 / hours,
+        above as f64 / (EVALUATIONS - WARM_UP) as f64,
+    )
+}
+
+/// **What keeps a quantised egress parked rather than hunting is which target the controller is handed.**
+///
+/// The translator hands the controller the rounded target it advertised (sv2-apps `67d87bb5`, which
+/// validates shares against it), so the estimate reads the truth and the only effect of the rounding is
+/// the standing excess `D_intended / D_served` the bound above carries. Handed the target for its
+/// unrounded belief instead, the controller would read `H / D_served` below an octave boundary and half
+/// that above it, so whenever both sides clear their bars it is driven back across: a limit cycle of the
+/// gate, every 23 to 35 minutes mid-octave on these noise-free loops. Below about 15% above a power of two
+/// the tighten bar absorbs it and the belief parks an octave down, the stall above.
+#[test]
+fn the_served_target_is_what_keeps_a_quantised_egress_from_hunting() {
+    for spm in [6.0f32, 30.0] {
+        for x in [1.1, 1.2, 1.4, 1.6, 1.8] {
+            let (served_rev, served_above) = quantised_loop(x, spm, true);
+            let (unrounded_rev, unrounded_above) = quantised_loop(x, spm, false);
+            eprintln!(
+                "  [hunt] {spm:.0} spm, truth {x:.1}x an octave: handed the served target {served_rev:.2} \
+                 reversals/h ({:.0}% above), the unrounded one {unrounded_rev:.2} ({:.0}% above)",
+                served_above * 100.0,
+                unrounded_above * 100.0
+            );
+            assert_eq!(
+                served_rev, 0.0,
+                "handed the target it served, the controller reversed {served_rev:.2} times an hour at \
+                 {spm} spm with the truth {x}x an octave: a quantised egress should park, not hunt"
+            );
+            if x == 1.1 {
+                assert_eq!(
+                    unrounded_rev, 0.0,
+                    "at 1.1x an octave the tighten bar should absorb the hunt"
+                );
+            }
+            if x == 1.4 || x == 1.6 {
+                assert!(
+                    unrounded_rev > 2.0,
+                    "handed its unrounded target mid-octave, the controller should hunt across the boundary \
+                     (3.4 to 5.3 reversals an hour measured), and reversed {unrounded_rev:.2} at {spm} spm, {x}x"
+                );
+            }
+        }
+    }
+}

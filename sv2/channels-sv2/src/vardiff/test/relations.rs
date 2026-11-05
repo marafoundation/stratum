@@ -230,3 +230,79 @@ fn the_seam_and_the_window_cap_disagree_about_the_same_rate() {
         estimator_spread(SPARSE_SPM_SEAM as f64),
     );
 }
+
+/// **The step ceiling keeps the late-share loop from ringing.**
+///
+/// Shares found at the previous difficulty and read against the new target add `delta (b_k - b_(k-1))` to
+/// the observation, with `delta` the fraction of the tick before the miner applied the new difficulty, so a
+/// loop closes around the step. Everything between the estimate's deviation and the step -- the gate, the
+/// run discount, the step growth, the step bound -- is a time-varying gain in `[0, STEP_FRACTION_MAX]`, and
+/// the circle criterion on that loop rules out a sustained oscillation for any such gain below
+/// `2 / (1 + 2 delta)`: `2/3` at `delta = 1`. The relation is a compile-time assertion beside
+/// `STEP_FRACTION_MAX`; this checks the controller on the loop itself.
+#[test]
+fn the_step_ceiling_keeps_the_late_share_loop_from_ringing() {
+    use crate::{
+        target::hash_rate_to_target,
+        vardiff::{clock::MockClock, Vardiff},
+    };
+    use std::sync::Arc;
+    const TICK_SECS: u64 = 60;
+    const WARM_UP: u64 = 120;
+    const EVALUATIONS: u64 = 12 * 60;
+    const SPM: f32 = 30.0;
+    const TRUTH: f64 = 1.0e15;
+    for late in [0.0f64, 0.5, 1.0] {
+        let clock = Arc::new(MockClock::new(1_000_000));
+        let mut vardiff = VardiffState::new_with_clock(1.0, clock.clone()).expect("constructs");
+        let (mut belief, mut previous) = ((1.5 * TRUTH) as f32, (1.5 * TRUTH) as f32);
+        let (mut carry, mut fires, mut reversals, mut last, mut worst) =
+            (0.0f64, 0u32, 0u32, 0i8, 0.0f64);
+        for k in 0..EVALUATIONS {
+            let truth = TRUTH
+                * if k >= 9 * 60 {
+                    1.5
+                } else if k >= 6 * 60 {
+                    3.0
+                } else {
+                    1.0
+                };
+            carry += SPM as f64 * truth * (late / previous as f64 + (1.0 - late) / belief as f64);
+            let n = carry.floor();
+            carry -= n;
+            clock.advance(TICK_SECS);
+            for _ in 0..n as u64 {
+                vardiff.increment_shares_since_last_update();
+            }
+            let target =
+                hash_rate_to_target(belief as f64, SPM as f64).expect("positive inputs convert");
+            previous = belief;
+            if let Ok(Some(next)) = vardiff.try_vardiff(belief, &target, SPM) {
+                {
+                    let direction = if next > belief { 1 } else { -1 };
+                    fires += 1;
+                    reversals += (last != 0 && direction != last) as u32;
+                    last = direction;
+                }
+                belief = next;
+            }
+            if k >= WARM_UP {
+                worst = worst.max((belief as f64 / truth).ln().abs());
+            }
+        }
+        assert_eq!(
+            reversals, 2,
+            "with {:.0}% of each tick's shares found at the previous difficulty, the controller reversed \
+             {reversals} times over a 1.5x opening, a 3x step and a halving: the two the disturbances force, \
+             and no more, is what a step ceiling under 2/(1 + 2 delta) guarantees",
+            late * 100.0
+        );
+        eprintln!(
+            "  [late] {:.0}% of each tick's shares late: {fires} retargets and {reversals} reversals over a \
+             1.5x opening, a 3x step and a halving, worst |ln(belief/truth)| {worst:.3}, step ceiling {STEP_FRACTION_MAX} against \
+             2/(1+2*{late}) = {:.3}",
+            late * 100.0,
+            2.0 / (1.0 + 2.0 * late)
+        );
+    }
+}

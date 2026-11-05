@@ -492,3 +492,46 @@ fn the_settled_reading_is_underpowered_against_an_absolute_gate() {
         worst_relative * 100.0
     );
 }
+
+/// **The estimate's conversion is a quantiser, with a step of about `spm / 6000`.**
+///
+/// `hash_rate_from_target` truncates the mean share interval to 0.01 s (`as u128` of `6000 / spm`), so the
+/// hashrate the controller estimates moves in relative steps of `1 / floor(6000 / spm)` and reads high by
+/// about half a step: 0.25% at 30 spm, 1% at 120, 2% at 240 and 5% at 600. At the rates this crate is
+/// characterised at that is a standing offset; from about 240 spm the step is coarse enough to slow the
+/// response too.
+#[test]
+fn the_estimate_is_quantised_by_the_interval_truncation() {
+    for spm in [30.0f64, 120.0, 240.0, 600.0] {
+        let hashrate = 1.0e15;
+        let target = hash_rate_to_target(hashrate, spm).expect("positive inputs convert");
+        let (mut worst, mut sum, mut n) = (0.0f64, 0.0f64, 0u32);
+        for i in 0..=2000 {
+            let observed = spm * (0.9 + 0.2 * i as f64 / 2000.0);
+            let estimate = hash_rate_from_target(target.to_le_bytes().into(), observed)
+                .expect("a constructed target inverts");
+            let error = estimate / (hashrate * observed / spm) - 1.0;
+            worst = worst.max(error.abs());
+            sum += error;
+            n += 1;
+        }
+        let step = 1.0 / (6000.0 / spm).floor();
+        let mean_in_steps = sum / n as f64 / step;
+        assert!(
+            (0.4..0.65).contains(&mean_in_steps),
+            "{spm} spm: the estimate's mean bias is {mean_in_steps:.2} of a truncation step, not about half"
+        );
+        assert!(
+            worst <= 1.0 / (6000.0 / (1.1 * spm)).floor() * 1.001,
+            "{spm} spm: the estimate's worst error {:.2}% exceeds one truncation step at the sweep's edge",
+            worst * 100.0
+        );
+        eprintln!(
+            "  [truncation] {spm:.0} spm: the estimate reads {:.2}% high on average, {:.2}% at worst, against \
+             1/floor(6000/spm) = {:.2}%",
+            sum / n as f64 * 100.0,
+            worst * 100.0,
+            100.0 / (6000.0 / spm).floor()
+        );
+    }
+}

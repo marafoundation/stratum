@@ -746,3 +746,94 @@ fn the_quantised_path_crosses_the_octave_boundary() {
     );
     eprintln!("  [stall] {report}");
 }
+
+/// One deterministic run of a steady truth that starts rising `growth` per tick (in logs) at tick
+/// `RAMP_FROM`, on a continuous target. With `seed`, each tick's shares are a Poisson draw; without, the
+/// expected count, remainder carried. Returns the mean of ln(truth / belief) over `MEASURE`.
+fn ramp_offset(spm: f32, growth: f64, seed: Option<u64>) -> f64 {
+    const RAMP_FROM: u64 = 120;
+    const MEASURE: std::ops::Range<u64> = 360..600;
+    const TRUTH: f64 = 1.0e15;
+    let clock = Arc::new(MockClock::new(1_000_000));
+    let mut vardiff = VardiffState::new_with_clock(1.0, clock.clone()).expect("constructs");
+    let mut belief = TRUTH as f32;
+    let (mut carry, mut sum) = (0.0f64, 0.0f64);
+    let mut rng = XorShift64::new(seed.unwrap_or(1));
+    for k in 0..MEASURE.end {
+        let truth = TRUTH * (growth * k.saturating_sub(RAMP_FROM) as f64).exp();
+        let lambda = spm as f64 * truth / belief as f64;
+        let n = match seed {
+            Some(_) => sample_poisson(&mut rng, lambda) as f64,
+            None => {
+                carry += lambda;
+                let n = carry.floor();
+                carry -= n;
+                n
+            }
+        };
+        clock.advance(60);
+        for _ in 0..n as u64 {
+            vardiff.increment_shares_since_last_update();
+        }
+        let target =
+            hash_rate_to_target(belief as f64, spm as f64).expect("positive inputs convert");
+        if let Ok(Some(next)) = vardiff.try_vardiff(belief, &target, spm) {
+            belief = next;
+        }
+        if MEASURE.contains(&k) {
+            sum += (truth / belief as f64).ln();
+        }
+    }
+    sum / (MEASURE.end - MEASURE.start) as f64
+}
+
+/// **A rising miner is followed, behind the tighten bar.**
+///
+/// A steady rise is the one disturbance shape the four regimes above leave out. The linear core follows it
+/// `1/f + 1/(1 - alpha) - 1 = 10.5` evaluations behind; the asymmetric bar makes the belief wait for eight
+/// times the evidence before each tightening, so the lag is longer, and longer at the denser rate whose bar
+/// is higher. With Poisson shares, a 12.7%-an-hour rise is followed 21 evaluations behind at 6 spm and 50 at
+/// 30, the belief 4% and 10% under the truth; with the expected count, which never crosses the bar early,
+/// 70 and 89.
+#[test]
+fn a_rising_miner_is_followed_behind_the_tighten_bar() {
+    const GROWTH: f64 = 0.002;
+    const TRIALS: u64 = 40;
+    for spm in [6.0f32, 30.0] {
+        let quiet = ramp_offset(spm, GROWTH, None) - ramp_offset(spm, 0.0, None);
+        let noisy = (0..TRIALS)
+            .map(|i| {
+                ramp_offset(spm, GROWTH, Some(0xA3_0000 + i))
+                    - ramp_offset(spm, 0.0, Some(0xA3_0000 + i))
+            })
+            .sum::<f64>()
+            / TRIALS as f64;
+        // The linear core's lag is 1/f + 1/(1 - alpha) - 1 = 10.5 evaluations at f = 0.2; the tighten bar
+        // adds to it, and noise can only bring a fire forward.
+        assert!(
+            noisy / GROWTH > 15.0,
+            "{spm} spm: a lag of {:.1} evaluations is under the bar's",
+            noisy / GROWTH
+        );
+        assert!(
+            quiet >= noisy,
+            "{spm} spm: noise should only shorten the lag"
+        );
+        if spm == 30.0 {
+            assert!(
+                noisy < 0.15,
+                "30 spm: the belief ran {:.1}% behind a 12.7%/h rise",
+                noisy * 100.0
+            );
+        }
+        eprintln!(
+            "  [ramp] {spm:.0} spm, a {:.1}%/h rise: the belief runs {:.1}% behind the truth with Poisson shares \
+             (a lag of {:.1} evaluations, {TRIALS} trials), {:.1}% with the expected count ({:.1})",
+            ((GROWTH * 60.0).exp() - 1.0) * 100.0,
+            noisy * 100.0,
+            noisy / GROWTH,
+            quiet * 100.0,
+            quiet / GROWTH
+        );
+    }
+}

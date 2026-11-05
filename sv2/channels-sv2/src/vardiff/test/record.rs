@@ -25,13 +25,14 @@ fn every_test_named_by_the_record_exists() {
     const RECORD: &str = include_str!("../../../VARDIFF.md");
     /// Each test file the record is allowed to name, with its source, so a reference to a file that does
     /// not exist fails here rather than resolving vacuously.
-    const SOURCES: [(&str, &str); 12] = [
+    const SOURCES: [(&str, &str); 13] = [
         (
             "actuator_granularity.rs",
             include_str!("actuator_granularity.rs"),
         ),
         ("classic.rs", include_str!("classic.rs")),
         ("cold_start.rs", include_str!("cold_start.rs")),
+        ("instruments.rs", include_str!("instruments.rs")),
         ("outage.rs", include_str!("outage.rs")),
         ("quantisation.rs", include_str!("quantisation.rs")),
         ("record.rs", include_str!("record.rs")),
